@@ -7,6 +7,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "stylesheet_compat.h"
+#include "esp_brookesia.hpp"
 
 // Suppress missing field initializer warnings for ESP-Brookesia structures
 #pragma GCC diagnostic push
@@ -59,7 +60,10 @@ extern "C" void app_main(void)
     assert(phone != nullptr && "Failed to create phone");
 
     // Let the library select a stylesheet that matches the actual display size
-    ESP_BROOKESIA_CHECK_FALSE_EXIT(phone->begin(), "Failed to begin phone");
+    if (!phone->begin()) {
+        ESP_LOGE(TAG, "Failed to begin phone");
+        abort();
+    }
 
     // Minimal phone without extra example apps; add apps later as dependencies are added
 
