@@ -1,0 +1,91 @@
+## IDF Component Manager Manifest File
+## ESP32-P4 + JC4880P433C Phone Boilerplate
+## Organized for easy feature enabling/disabling
+
+version: 0.0.1
+
+dependencies:
+  # ========================================
+  # CORE SYSTEM DEPENDENCIES (Always Required)
+  # ========================================
+  idf: ">=5.5.1"
+  
+  # ========================================
+  # UI FRAMEWORK & DISPLAY (Core Phone Features)
+  # ========================================
+  espressif/esp-brookesia: "0.4.*"        # Phone UI framework and app manager
+  espressif/esp_lvgl_port: "^2"           # LVGL integration for ESP-IDF
+  lvgl/lvgl: ">=8,<10"                    # LVGL graphics library
+  
+  # ========================================
+  # HARDWARE BOARD SUPPORT PACKAGE
+  # ========================================
+  csvke/esp32_p4_jc4880p433c_bsp:          # JC4880P433C board support package
+    git: "https://github.com/csvke/esp32_p4_jc4880p433c_bsp.git"
+  
+  # ========================================
+  # AUDIO & MEDIA FEATURES (Currently Enabled)
+  # ========================================
+  esp_codec_dev: "1.2.*"                  # Audio codec device abstraction
+  espressif/esp_video: "*"                # Video processing framework
+  espressif/avi_player: "^2.0.0"          # AVI video player component
+  
+  # ========================================
+  # ADDITIONAL AUDIO COMPONENTS (Enable as needed)
+  # ========================================
+  # chmorgan/esp-audio-player: "*"        # Alternative audio player implementation
+  # chmorgan/esp-file-iterator: "*"       # File iteration for media scanning
+  # chmorgan/esp-libhelix-mp3: "*"        # MP3 decoder using Helix library
+  
+  # ========================================
+  # CAMERA & COMPUTER VISION APPS
+  # ========================================
+  # espressif/esp_cam_sensor: "*"         # Camera sensor drivers (OV2640, OV3660, etc.)
+  # espressif/usb_host_uvc: "*"           # USB camera support (UVC protocol)
+  
+  # AI/ML Model Components (Uncomment for AI apps):
+  # human_face_detect: "*"                # Human face detection model
+  # pedestrian_detect: "*"               # Pedestrian detection model
+  
+  # ========================================
+  # NETWORKING & COMMUNICATION APPS
+  # ========================================
+  # espressif/esp_wifi_remote: "*"        # WiFi remote control functionality
+  # espressif/esp_hosted: "*"             # ESP-Hosted for WiFi/BT bridge
+  # espressif/eppp_link: "*"              # PPP over Ethernet link
+  # espressif/wifi_remote_over_eppp: "*"  # WiFi remote over PPP-Ethernet
+  
+  # ========================================
+  # SPECIALIZED HARDWARE INTERFACES
+  # ========================================
+  # espressif/esp_sccb_intf: "*"          # SCCB interface for camera modules
+  # espressif/esp_ipa: "*"                # Image Processing Accelerator
+  # espressif/cmake_utilities: "*"        # CMake utility functions
+  
+  # ========================================
+  # FILE MANAGEMENT APPS
+  # ========================================
+  # (File manager app uses existing SPIFFS - no extra dependencies needed)
+  # (SD card support would require additional SPI/SDMMC drivers if needed)
+  
+  # ========================================
+  # BROOKESIA PHONE APPS (Add when implementing)
+  # ========================================
+  # To add specific Brookesia apps, copy from:
+  # https://github.com/espressif/esp-brookesia/tree/master/apps
+  # 
+  # Available apps include:
+  # - File Manager:    Browse SPIFFS/SD files
+  # - Settings:        System configuration UI
+  # - Media Player:    Audio/video playback
+  # - Calculator:      Basic calculator app
+  # - Camera:          Camera capture app (requires camera)
+  #
+  # Integration: Copy app to components/apps/ and register in main.cpp
+  
+  # ========================================
+  # CUSTOM APP DEPENDENCIES
+  # ========================================
+  # Add your custom app dependencies here:
+  # your_company/custom_sensor_driver: "*"
+  # your_company/custom_protocol: "*"
