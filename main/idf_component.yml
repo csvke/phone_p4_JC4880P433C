@@ -21,7 +21,7 @@ dependencies:
   # HARDWARE BOARD SUPPORT PACKAGE
   # ========================================
   csvke/esp32_p4_jc4880p433c_bsp:          # JC4880P433C board support package
-    version: "v1.1.0"
+    version: "v1.1.1"
     git: "https://github.com/csvke/esp32_p4_jc4880p433c_bsp.git"
   
   # ========================================
