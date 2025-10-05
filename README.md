@@ -62,6 +62,46 @@ idf.py build
 idf.py flash monitor
 ```
 
+### Local BSP Development (Optional)
+
+By default, the BSP is automatically downloaded from GitHub via the component manager. If you want to modify the BSP or develop locally:
+
+1. **Clone the BSP repository** alongside your project:
+```bash
+cd /path/to/your/workspace
+git clone https://github.com/csvke/esp32_p4_jc4880p433c_bsp.git
+```
+
+2. **Update CMakeLists.txt** to use local BSP:
+```cmake
+set(EXTRA_COMPONENT_DIRS 
+    ${CMAKE_CURRENT_LIST_DIR}/components
+    ${CMAKE_CURRENT_LIST_DIR}/../esp32_p4_jc4880p433c_bsp  # Add this line
+)
+```
+
+3. **Comment out BSP in idf_component.yml**:
+```yaml
+# csvke/esp32_p4_jc4880p433c_bsp:
+#   git: "https://github.com/csvke/esp32_p4_jc4880p433c_bsp.git"
+```
+
+4. **Rebuild the project**:
+```bash
+idf.py fullclean
+idf.py build
+```
+
+**When to use local BSP:**
+- 🔧 Developing or debugging BSP features
+- 🎨 Customizing display timing or touch parameters
+- 📝 Contributing to the BSP repository
+- 🧪 Testing BSP changes before pushing
+
+**Note:** Remember to switch back to the component manager version before committing your changes unless you're specifically modifying the BSP.
+
+---
+
 **Expected boot output**:
 ```
 I (1172) app_init: Project name:     phone_p4_JC4880P433C
@@ -120,7 +160,7 @@ phone_p4_JC4880P433C/
 1. **Moved Brookesia to `components/`**: Allows customization without managed component conflicts
 2. **Version Macros**: Added compile definitions for BROOKESIA_CORE_VER (0.6.0)
 3. **Software Rotation**: Enabled `.sw_rotate = true` for ST7701S compatibility
-4. **Local BSP**: Uses local BSP from `../esp32_p4_jc4880p433c_bsp` with SPIFFS auto-format
+4. **BSP from GitHub**: Uses [esp32_p4_jc4880p433c_bsp](https://github.com/csvke/esp32_p4_jc4880p433c_bsp) from component manager with SPIFFS auto-format
 5. **Namespace Types**: Using `esp_brookesia::systems::phone::Phone` (no deprecation warnings)
 
 ### Customizing Display Settings
@@ -170,7 +210,8 @@ phone->installApp(myApp);
 
 ### Build Issues
 - **Brookesia hash mismatch**: Brookesia is in `components/` folder (not `managed_components/`)
-- **BSP not found**: Ensure `../esp32_p4_jc4880p433c_bsp` exists or update `CMakeLists.txt` path
+- **BSP not downloaded**: Run `idf.py reconfigure` to fetch BSP from GitHub
+- **Component manager errors**: Ensure you have internet connection for first build
 - **LVGL version error**: Project requires LVGL 9.2.2 (automatically managed)
 
 ### Runtime Issues

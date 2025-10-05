@@ -23,10 +23,8 @@ dependencies:
   # ========================================
   # HARDWARE BOARD SUPPORT PACKAGE
   # ========================================
-  # Using local BSP from workspace (../esp32_p4_jc4880p433c_bsp)
-  # csvke/esp32_p4_jc4880p433c_bsp:          # JC4880P433C board support package
-  #   version: "v1.1.2"
-  #   git: "https://github.com/csvke/esp32_p4_jc4880p433c_bsp.git"
+  csvke/esp32_p4_jc4880p433c_bsp:          # JC4880P433C board support package
+    git: "https://github.com/csvke/esp32_p4_jc4880p433c_bsp.git"
   
   # ========================================
   # AUDIO & MEDIA FEATURES (Currently Enabled)
