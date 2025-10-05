@@ -1,107 +1,209 @@
-# ESP32-P4 JC4880P433C Phone Project
+# ESP32-P4 Brookesia Phone UI for JC4880P433C
 
-ESP-IDF phone application using ESP-Brookesia framework for the JC4880P433C development board with ESP32-P4.
+A production-ready phone interface using ESP-Brookesia framework on the JC4880P433C development board with ESP32-P4.
 
-## Hardware
+## 🎯 Features
 
-- **Board**: JC4880P433C development board
-- **MCU**: ESP32-P4 RISC-V dual-core processor
-- **Display**: 4.3" 480x800 ST7701 MIPI-DSI LCD with GT911 touch
-- **Framework**: ESP-Brookesia phone UI framework
+- ✨ **Complete Phone UI**: App launcher, navigation bar, status bar, and recents screen
+- 📱 **480x800 Native Display**: Optimized dark theme stylesheet
+- 👆 **Touch Support**: GT911 capacitive touch controller with explicit device configuration
+- 🎨 **LVGL 9.2.2**: Hardware-accelerated graphics with software rotation
+- 💾 **SPIFFS Storage**: Auto-formatting support for user data (4MB partition)
+- 🔧 **Production Ready**: Clean boot with zero errors/warnings
+- 🎮 **Gesture Navigation**: Swipe gestures for home, back, and app switching
 
-## Features
+## 🔧 Hardware Specifications
 
-- Complete phone UI framework using ESP-Brookesia
-- LVGL-based graphical interface
-- Touch screen support
-- PWM backlight control
-- SPIFFS file system for data storage
-- Brightness control demo included
+| Component | Specification |
+|-----------|--------------|
+| **Board** | JC4880P433C Development Board |
+| **MCU** | ESP32-P4 RISC-V Dual-Core @ 360MHz |
+| **PSRAM** | 32MB PSRAM @ 200MHz |
+| **Flash** | 16MB Flash (QIO mode) |
+| **Display** | 4.3" 480x800 ST7701S MIPI-DSI LCD |
+| **Touch** | GT911 I2C Capacitive Touch |
+| **Interface** | USB-Serial/JTAG |
 
-## Dependencies
+## 📦 Software Stack
 
-This project uses the [esp32_p4_jc4880p433c_bsp](https://github.com/csvke/esp32_p4_jc4880p433c_bsp) component for hardware support.
+- **ESP-IDF**: v5.5.1
+- **Brookesia**: v0.6.0 (feat/add_phone_stylesheet_480_800 branch)
+- **LVGL**: v9.2.2
+- **BSP**: [esp32_p4_jc4880p433c_bsp](https://github.com/csvke/esp32_p4_jc4880p433c_bsp)
 
-## Getting Started
+## 🚀 Quick Start
 
 ### Prerequisites
 
-- ESP-IDF v5.5.1 or later
-- ESP32-P4 development environment
+- [ESP-IDF v5.5.1](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32p4/get-started/index.html)
+- ESP32-P4 development environment configured
+- JC4880P433C board with USB connection
 
-### Building
+### Build and Flash
 
-1. Clone this repository:
+1. **Clone the repository**:
 ```bash
-git clone https://github.com/csvke/phone_p4_JC4880P433C.git
+git clone --recursive https://github.com/csvke/phone_p4_JC4880P433C.git
 cd phone_p4_JC4880P433C
 ```
 
-2. Set up ESP-IDF environment:
+2. **Set up ESP-IDF environment**:
 ```bash
-source ~/esp/esp-idf/export.sh
+source ~/esp/esp-idf/export.sh  # Adjust path to your ESP-IDF installation
 ```
 
-3. Configure and build:
+3. **Build the project**:
 ```bash
 idf.py build
 ```
 
-4. Flash to device:
+4. **Flash to device**:
 ```bash
 idf.py flash monitor
 ```
 
-## Project Structure
+**Expected boot output**:
+```
+I (1172) app_init: Project name:     phone_p4_JC4880P433C
+I (1177) app_init: App version:      ee54e9e-dirty
+I (1626) main: Display started successfully
+I (1630) main: GT911 touch device explicitly set (@0x4ff41de8)
+I (1640) main: 480x800 stylesheet activated for native display resolution
+I (1646) BS:Core: Library version: 0.6.0
+I (1681) main: setup done
+```
+
+## 📁 Project Structure
 
 ```
 phone_p4_JC4880P433C/
-├── main/                 # Main application code
-├── demo/                 # Demo applications
-│   └── brightness_test/  # Brightness control demo
-├── spiffs/              # SPIFFS filesystem data
-├── CMakeLists.txt       # Project configuration
-└── README.md           # This file
+├── components/
+│   └── espressif__esp-brookesia/  # Brookesia UI framework (customized)
+├── main/
+│   ├── main.cpp                   # Application entry point
+│   ├── idf_component.yml          # Component dependencies
+│   └── stylesheet_compat.h        # Stylesheet compatibility layer
+├── CMakeLists.txt                 # Project build configuration
+├── partitions.csv                 # Flash partition table
+├── sdkconfig.defaults             # Default project configuration
+└── README.md                      # This file
 ```
 
-## Demos
+## 🎨 Key Implementations
 
-### Brightness Test
+### Display Configuration
+- **Resolution**: 480x800 portrait orientation
+- **Software Rotation**: Enabled (ST7701S doesn't support hardware rotation)
+- **Color Format**: RGB565
+- **PSRAM Buffers**: 480 × 80 pixels (double buffering disabled for memory efficiency)
+- **Backlight**: PWM-controlled via GPIO
 
-Located in `demo/brightness_test/`, this demonstrates:
-- PWM backlight control
-- LVGL UI integration
-- Visible brightness adjustment testing
+### Touch Configuration
+- **Controller**: GT911 on I2C (SCL=GPIO8, SDA=GPIO7)
+- **Explicit Device Setting**: Touch device passed directly to Brookesia to avoid auto-detection
+- **External Pull-ups**: Hardware pull-ups present (I2C warnings suppressed)
 
-To build and run the brightness demo:
-```bash
-cd demo/brightness_test
-idf.py build flash monitor
+### Storage Partitions
+| Partition | Type | Size | Purpose |
+|-----------|------|------|---------|
+| nvs | data | 24KB | Non-volatile storage |
+| phy_init | data | 4KB | PHY initialization |
+| factory | app | 7MB | Main application |
+| storage | spiffs | 4MB | User data (auto-format enabled) |
+| anim_emotion | data | 2MB | Emotion animations |
+| anim_boot | data | 1MB | Boot animations |
+| anim_icon | data | 1.5MB | Icon animations |
+
+## 🔧 Configuration
+
+### Key Changes from Default Brookesia
+1. **Moved Brookesia to `components/`**: Allows customization without managed component conflicts
+2. **Version Macros**: Added compile definitions for BROOKESIA_CORE_VER (0.6.0)
+3. **Software Rotation**: Enabled `.sw_rotate = true` for ST7701S compatibility
+4. **Local BSP**: Uses local BSP from `../esp32_p4_jc4880p433c_bsp` with SPIFFS auto-format
+5. **Namespace Types**: Using `esp_brookesia::systems::phone::Phone` (no deprecation warnings)
+
+### Customizing Display Settings
+Edit `main/main.cpp` to adjust display configuration:
+```cpp
+bsp_display_cfg_t cfg = {
+    .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
+    .buffer_size = BSP_LCD_H_RES * 80,  // Adjust buffer size
+    .double_buffer = false,              // Enable for smoother rendering
+    .flags = {
+        .buff_dma = false,
+        .buff_spiram = true,
+        .sw_rotate = true,               // Required for ST7701S
+    }
+};
 ```
 
-## Configuration
+## 📱 Development
 
-The hardware-specific configuration is handled by the BSP component. For timing adjustments or pin modifications, refer to the [BSP repository](https://github.com/csvke/esp32_p4_jc4880p433c_bsp).
+### Adding Phone Apps
+Brookesia supports modular phone app development:
 
-## Development
+```cpp
+// Create your custom app
+class MyApp : public esp_brookesia::systems::phone::App {
+public:
+    MyApp() : App("MyApp") {}
+    bool run() override {
+        // Your app logic
+        return true;
+    }
+};
 
-### Adding Applications
+// In main.cpp, register your app
+MyApp *myApp = new MyApp();
+phone->installApp(myApp);
+```
 
-ESP-Brookesia supports modular app development. To add new applications:
+### Available UI Components
+- **App Launcher**: Home screen with app icons
+- **Navigation Bar**: Bottom navigation (home, back, recents)
+- **Status Bar**: Top bar with battery, WiFi, time
+- **Recents Screen**: App switcher with snapshots
+- **Gesture Support**: Swipe gestures for navigation
 
-1. Create your app in `components/apps/your_app/`
-2. Implement the ESP-Brookesia app interface
-3. Register the app in `main.cpp`
+## 🐛 Troubleshooting
 
-### Custom Components
+### Build Issues
+- **Brookesia hash mismatch**: Brookesia is in `components/` folder (not `managed_components/`)
+- **BSP not found**: Ensure `../esp32_p4_jc4880p433c_bsp` exists or update `CMakeLists.txt` path
+- **LVGL version error**: Project requires LVGL 9.2.2 (automatically managed)
 
-Add custom components to the `components/` directory or use the ESP Component Manager in `main/idf_component.yml`.
+### Runtime Issues
+- **Display not working**: Check MIPI-DSI connections and power (LDO ch3: 2500mV)
+- **Touch not responding**: Verify GT911 I2C connection (SCL=GPIO8, SDA=GPIO7)
+- **SPIFFS mount failed**: First boot auto-formats SPIFFS (takes ~1 second)
 
-## License
+## 📚 References
 
-This project is licensed under the Apache License 2.0.
+- [ESP-Brookesia Documentation](https://github.com/espressif/esp-brookesia)
+- [ESP32-P4 Technical Reference](https://www.espressif.com/en/products/socs/esp32-p4)
+- [ESP-IDF Programming Guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/)
+- [LVGL Documentation](https://docs.lvgl.io/9.2/)
+- [BSP Repository](https://github.com/csvke/esp32_p4_jc4880p433c_bsp)
 
-## Related Projects
+## 📝 License
 
-- [esp32_p4_jc4880p433c_bsp](https://github.com/csvke/esp32_p4_jc4880p433c_bsp) - Board Support Package
-- [ESP-Brookesia](https://github.com/espressif/esp-brookesia) - Phone UI Framework
+This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
+
+## 🔗 Related Projects
+
+- [esp32_p4_jc4880p433c_bsp](https://github.com/csvke/esp32_p4_jc4880p433c_bsp) - Board Support Package with I2C, display, and touch initialization
+- [ESP-Brookesia](https://github.com/espressif/esp-brookesia) - Espressif's phone UI framework for embedded systems
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit issues or pull requests.
+
+## 👤 Author
+
+**csvke**
+- GitHub: [@csvke](https://github.com/csvke)
+
+---
+
+**Status**: ✅ Production Ready | **Last Updated**: October 6, 2025
