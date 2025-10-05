@@ -6,9 +6,11 @@
 
 #pragma once
 
-// Define version macros to fix build error (based on ESP_BROOKESIA: 0.6.0)
+// Define version macros to fix build error
+// Base: ESP-Brookesia v0.5.0 from ESP Component Registry
+// Custom: 480x800 stylesheet manually incorporated from feat/add_phone_stylesheet_480_800 branch
 #define BROOKESIA_CORE_VER_MAJOR 0
-#define BROOKESIA_CORE_VER_MINOR 6
+#define BROOKESIA_CORE_VER_MINOR 5
 #define BROOKESIA_CORE_VER_PATCH 0
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

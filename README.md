@@ -27,7 +27,7 @@ A production-ready phone interface using ESP-Brookesia framework on the JC4880P4
 ## 📦 Software Stack
 
 - **ESP-IDF**: v5.5.1
-- **Brookesia**: v0.6.0 (feat/add_phone_stylesheet_480_800 branch)
+- **Brookesia**: v0.5.0 (customized with 480x800 stylesheet from [feat/add_phone_stylesheet_480_800](https://github.com/espressif/esp-brookesia/tree/feat/add_phone_stylesheet_480_800))
 - **LVGL**: v9.2.2
 - **BSP**: [esp32_p4_jc4880p433c_bsp](https://github.com/csvke/esp32_p4_jc4880p433c_bsp)
 
@@ -156,12 +156,31 @@ phone_p4_JC4880P433C/
 
 ## 🔧 Configuration
 
+### Custom Brookesia Version
+
+This project uses a **customized ESP-Brookesia v0.5.0** with 480x800 stylesheet support:
+
+**Base**: Official ESP-Brookesia v0.5.0 from [ESP Component Registry](https://components.espressif.com/components/espressif/esp-brookesia)
+
+**Custom Addition**: 480x800 phone stylesheet manually incorporated from Espressif's feature branch:
+- Source: [feat/add_phone_stylesheet_480_800](https://github.com/espressif/esp-brookesia/tree/feat/add_phone_stylesheet_480_800)
+- Files added: `systems/phone/stylesheets/480_800/` directory with dark theme
+- Reason: Official v0.5.0 only includes 320x240 and 800x480 stylesheets
+
+**Why Custom?**
+- Native 480x800 portrait display requires specific stylesheet
+- Feature branch not yet merged or released in official version
+- Allows optimal UI layout for 4.3" 480x800 portrait screen
+
+**Version Identifier**: `0.5.0+480x800` (in `idf_component.yml`)
+
 ### Key Changes from Default Brookesia
 1. **Moved Brookesia to `components/`**: Allows customization without managed component conflicts
-2. **Version Macros**: Added compile definitions for BROOKESIA_CORE_VER (0.6.0)
-3. **Software Rotation**: Enabled `.sw_rotate = true` for ST7701S compatibility
-4. **BSP from GitHub**: Uses [esp32_p4_jc4880p433c_bsp](https://github.com/csvke/esp32_p4_jc4880p433c_bsp) from component manager with SPIFFS auto-format
-5. **Namespace Types**: Using `esp_brookesia::systems::phone::Phone` (no deprecation warnings)
+2. **Version Macros**: Added compile definitions for BROOKESIA_CORE_VER (0.5.0)
+3. **480x800 Stylesheet**: Manually added from feature branch for native display support
+4. **Software Rotation**: Enabled `.sw_rotate = true` for ST7701S compatibility
+5. **BSP from GitHub**: Uses [esp32_p4_jc4880p433c_bsp](https://github.com/csvke/esp32_p4_jc4880p433c_bsp) from component manager with SPIFFS auto-format
+6. **Namespace Types**: Using `esp_brookesia::systems::phone::Phone` (no deprecation warnings)
 
 ### Customizing Display Settings
 Edit `main/main.cpp` to adjust display configuration:

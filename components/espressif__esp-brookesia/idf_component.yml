@@ -1,5 +1,5 @@
-version: "0.6.0-beta2"
-description: ESP-Brookesia-Core is a core component of ESP-Brookesia.
+version: "0.5.0+480x800"
+description: ESP-Brookesia-Core is a core component of ESP-Brookesia. (Custom build with 480x800 stylesheet from feat/add_phone_stylesheet_480_800 branch)
 url: https://github.com/espressif/esp-brookesia/tree/master/core/brookesia_core
 issues: https://github.com/espressif/esp-brookesia/issues
 repository: https://github.com/espressif/esp-brookesia.git
