@@ -18,6 +18,36 @@ LV_IMG_DECLARE(img_app_calculator);
 
 namespace phone_apps {
 
+Calculator::Calculator() :
+    esp_brookesia::systems::phone::App(
+        // Core app configuration
+        {
+            .name = "Calculator",
+            .launcher_icon = esp_brookesia::gui::StyleImage::IMAGE(&img_app_calculator),
+            .screen_size = esp_brookesia::gui::StyleSize::RECT_PERCENT(100, 100),
+            .flags = {
+                .enable_default_screen = 1,
+                .enable_recycle_resource = 1,
+                .enable_resize_visual_area = 1,
+            }
+        },
+        // Phone-specific configuration
+        {
+            .app_launcher_page_index = 0,
+            .status_icon_area_index = 0,
+            .status_icon_data = {},
+            .status_bar_visual_mode = esp_brookesia::systems::phone::StatusBar::VisualMode::SHOW_FIXED,
+            .navigation_bar_visual_mode = esp_brookesia::systems::phone::NavigationBar::VisualMode::SHOW_FIXED,
+            .flags = {
+                .enable_status_icon_common_size = 0,
+                .enable_navigation_gesture = 1,
+            },
+        }
+    )
+{
+    ESP_LOGI("Calculator", "Initialized with automatic resource management enabled");
+}
+
 } // namespace phone_apps
 
 #define KEYBOARD_H_PERCENT      65
@@ -38,11 +68,6 @@ static const char *keyboard_map[] = {
     "0", ".", "=", ""
 };
 
-Calculator::Calculator():
-    esp_brookesia::systems::phone::App("Calculator", &img_app_calculator, true)
-{
-}
-
 Calculator::~Calculator()
 {
 
@@ -52,16 +77,10 @@ bool Calculator::run(void)
 {
     ESP_LOGI("Calculator", "run() called - starting calculator app");
     
-    // Get screen dimensions from the active screen instead of visual area
-    // Visual area might not be initialized yet when run() is called
-    lv_obj_t *scr = lv_scr_act();
-    if (scr == nullptr) {
-        ESP_LOGE("Calculator", "run() failed - lv_scr_act() returned nullptr");
-        return false;
-    }
-    
-    _width = lv_obj_get_width(scr);
-    _height = lv_obj_get_height(scr);
+        // Get visual area accounting for status bar and navigation bar
+    const auto &visual_area = getVisualArea();
+    _width = lv_area_get_width(&visual_area);
+    _height = lv_area_get_height(&visual_area);
     ESP_LOGI("Calculator", "Screen dimensions: %dx%d", _width, _height);
     formula_len = 1;
 
