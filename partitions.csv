@@ -2,4 +2,9 @@
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
 factory,  app,  factory, ,        7M,
-storage,  data, spiffs,  ,        6M,
+storage,  data, spiffs,  ,        4M,
+
+# Brookesia asset partitions (adjusted for actual asset size)
+anim_emotion, data, , , 2M
+anim_boot,    data, , , 1M
+anim_icon,    data, , , 1M

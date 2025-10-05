@@ -59,7 +59,10 @@ extern "C" void app_main(void)
     ESP_Brookesia_Phone *phone = new ESP_Brookesia_Phone(disp);
     assert(phone != nullptr && "Failed to create phone");
 
-    // Let the library select a stylesheet that matches the actual display size
+    // Activate the 480x800 stylesheet from the Brookesia branch
+    phone->activate_stylesheet("phone_480_800");
+
+    // Begin phone UI
     if (!phone->begin()) {
         ESP_LOGE(TAG, "Failed to begin phone");
         abort();

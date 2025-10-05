@@ -13,7 +13,10 @@ dependencies:
   # ========================================
   # UI FRAMEWORK & DISPLAY (Core Phone Features)
   # ========================================
-  espressif/esp-brookesia: "0.5.*"        # Phone UI framework and app manager (LVGL 9 support)
+  espressif/esp-brookesia:
+    version: "feat/add_phone_stylesheet_480_800"
+    git: "https://github.com/espressif/esp-brookesia.git"
+    path: "core/brookesia_core"
   espressif/esp_lvgl_port: "^2"           # LVGL integration for ESP-IDF
   lvgl/lvgl: ">=9,<10"                    # LVGL graphics library (upgraded to v9)
   
