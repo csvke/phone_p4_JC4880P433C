@@ -17,6 +17,9 @@ static const char *TAG = "main";
 
 extern "C" void app_main(void)
 {
+    // Suppress harmless I2C pull-up warning (external pull-ups are present on hardware)
+    esp_log_level_set("i2c.master", ESP_LOG_ERROR);
+    
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -24,8 +27,13 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    ESP_ERROR_CHECK(bsp_spiffs_mount());
-    ESP_LOGI(TAG, "SPIFFS mount successfully");
+    // Try to mount SPIFFS, but don't fail if it's not available
+    err = bsp_spiffs_mount();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SPIFFS mount failed (%s), continuing without SPIFFS", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "SPIFFS mount successfully");
+    }
 
     // Optional: SD card
     bsp_sdcard_mount();
@@ -39,7 +47,7 @@ extern "C" void app_main(void)
         .flags = {
             .buff_dma = false,
             .buff_spiram = true,
-            .sw_rotate = false,
+            .sw_rotate = true,  // Enable SW rotation - ST7701S doesn't support HW swap_xy/mirror
         }
     };
     
@@ -56,19 +64,30 @@ extern "C" void app_main(void)
 
     bsp_display_lock(0);
 
-    ESP_Brookesia_Phone *phone = new ESP_Brookesia_Phone(disp);
+    // Create phone system with explicit display
+    esp_brookesia::systems::phone::Phone *phone = new esp_brookesia::systems::phone::Phone(disp);
     assert(phone != nullptr && "Failed to create phone");
 
-    // Activate the 480x800 stylesheet from the Brookesia branch
-    phone->activate_stylesheet("phone_480_800");
-
-    // Begin phone UI
-    if (!phone->begin()) {
-        ESP_LOGE(TAG, "Failed to begin phone");
-        abort();
+    // Get and explicitly set the GT911 touch device (already initialized by BSP)
+    lv_indev_t *touch_indev = lv_indev_get_next(nullptr);
+    if (touch_indev != nullptr && lv_indev_get_type(touch_indev) == LV_INDEV_TYPE_POINTER) {
+        phone->setTouchDevice(touch_indev);
+        ESP_LOGI(TAG, "GT911 touch device explicitly set (@0x%p)", touch_indev);
+    } else {
+        ESP_LOGW(TAG, "Touch device not found, will use auto-detection");
     }
 
-    // Minimal phone without extra example apps; add apps later as dependencies are added
+    // Use 480x800 stylesheet - perfect match for JC4880P443C display
+    ESP_LOGI(TAG, "Display resolution: %dx%d", BSP_LCD_H_RES, BSP_LCD_V_RES);
+    esp_brookesia::systems::phone::Stylesheet stylesheet = ESP_BROOKESIA_PHONE_480_800_DARK_STYLESHEET();
+    
+    // Configure and activate the stylesheet
+    assert(phone->addStylesheet(&stylesheet) && "Add 480x800 stylesheet failed");
+    assert(phone->activateStylesheet(&stylesheet) && "Activate 480x800 stylesheet failed");
+    ESP_LOGI(TAG, "480x800 stylesheet activated for native display resolution");
+
+    // Begin the phone interface
+    assert(phone->begin() && "Phone begin failed");
 
     ESP_LOGI(TAG, "setup done");
     bsp_display_unlock();

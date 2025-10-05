@@ -1,10 +1,10 @@
 # Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, ,        7M,
-storage,  data, spiffs,  ,        4M,
+ nvs,      data, nvs,     0x9000,  0x6000,
+ phy_init, data, phy,     0xf000,  0x1000,
+ factory,  app,  factory, ,        0x700000,
+ storage,  data, spiffs,  ,        0x400000,
 
 # Brookesia asset partitions (adjusted for actual asset size)
-anim_emotion, data, , , 2M
-anim_boot,    data, , , 1M
-anim_icon,    data, , , 1M
+ anim_emotion, data, , , 0x200000
+ anim_boot,    data, , , 0x100000
+ anim_icon,    data, , , 0x180000
