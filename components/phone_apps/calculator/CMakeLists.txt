@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS 
+        "Calculator.cpp"
+        "assets/img_app_calculator.c"
+    INCLUDE_DIRS 
+        "."
+    REQUIRES 
+        brookesia_core
+        lvgl
+)

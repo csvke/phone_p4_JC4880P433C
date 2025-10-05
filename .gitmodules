@@ -1,0 +1,4 @@
+[submodule "components/esp-brookesia"]
+	path = components/esp-brookesia
+	url = https://github.com/espressif/esp-brookesia.git
+	branch = feat/add_phone_stylesheet_480_800
