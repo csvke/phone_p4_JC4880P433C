@@ -29,6 +29,7 @@ CONFIG_VFS_MAX_COUNT=15
 # BSP and LVGL config (BSP_* symbols removed; behavior set in code)
 CONFIG_LV_COLOR_SCREEN_TRANSP=y
 CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
+CONFIG_LV_USE_SNAPSHOT=y
 
 # Fonts and demos for Brookesia
 CONFIG_LV_FONT_MONTSERRAT_16=y
