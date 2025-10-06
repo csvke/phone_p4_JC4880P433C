@@ -6,8 +6,9 @@
 #include "esp_task_wdt.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
-#include "stylesheet_compat.h"
 #include "esp_brookesia.hpp"
+#include "systems/phone/stylesheets/480_800/dark/stylesheet.hpp"
+#include "Calculator.hpp"
 
 // Suppress missing field initializer warnings for ESP-Brookesia structures
 #pragma GCC diagnostic push
@@ -88,6 +89,11 @@ extern "C" void app_main(void)
 
     // Begin the phone interface
     assert(phone->begin() && "Phone begin failed");
+
+    // Install Calculator app - keep shared_ptr alive to prevent deallocation
+    static std::shared_ptr<phone_apps::Calculator> calculator = std::make_shared<phone_apps::Calculator>();
+    assert(phone->getManager().installApp(calculator.get()) && "Install Calculator app failed");
+    ESP_LOGI(TAG, "Calculator app installed successfully");
 
     ESP_LOGI(TAG, "setup done");
     bsp_display_unlock();
