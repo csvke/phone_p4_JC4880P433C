@@ -201,6 +201,54 @@ bsp_display_cfg_t cfg = {
 
 ## 📱 Development
 
+### Creating a Clean Phone UI Boilerplate
+
+To create a minimal phone interface without any apps (clean slate for your own development):
+
+1. **Remove the Calculator app** from `main/main.cpp`:
+```cpp
+// Comment out or remove these lines:
+// #include "Calculator.hpp"
+// phone_apps::Calculator calculator;
+// phone->installApp(&calculator);
+```
+
+2. **Clean up the phone_apps component**:
+```bash
+# Remove the calculator directory
+rm -rf components/phone_apps/calculator
+
+# Or keep the structure but remove just the Calculator files
+rm components/phone_apps/calculator/Calculator.cpp
+rm components/phone_apps/calculator/Calculator.hpp
+```
+
+3. **Update CMakeLists.txt** if you removed the entire phone_apps:
+```cmake
+set(EXTRA_COMPONENT_DIRS 
+    ${CMAKE_CURRENT_LIST_DIR}/components
+    ${CMAKE_CURRENT_LIST_DIR}/components/esp-brookesia/core/brookesia_core
+    # Remove this line if you deleted phone_apps:
+    # ${CMAKE_CURRENT_LIST_DIR}/components/phone_apps/calculator
+)
+```
+
+4. **Rebuild**:
+```bash
+idf.py fullclean
+idf.py build
+```
+
+**Result**: You'll have a clean Brookesia Phone UI with:
+- ✅ App launcher (empty - ready for your apps)
+- ✅ Navigation bar (home, back, recents)
+- ✅ Status bar (battery, WiFi, time)
+- ✅ Recents screen
+- ✅ Gesture navigation
+- ❌ No pre-installed apps
+
+This gives you a production-ready phone UI framework as a starting point for your own applications!
+
 ### Adding Phone Apps
 Brookesia supports modular phone app development:
 
@@ -208,17 +256,38 @@ Brookesia supports modular phone app development:
 // Create your custom app
 class MyApp : public esp_brookesia::systems::phone::App {
 public:
-    MyApp() : App("MyApp") {}
+    MyApp() : App("MyApp", "<icon_path>") {}
+    
     bool run() override {
-        // Your app logic
+        // Called when app is launched
+        // Create your LVGL UI here
+        return true;
+    }
+    
+    bool back() override {
+        // Called when back button is pressed
+        // Clean up and return true to close app
+        return true;
+    }
+    
+    bool close() override {
+        // Called when app is closed
+        // Clean up resources
         return true;
     }
 };
 
-// In main.cpp, register your app
+// In main.cpp, create and install your app
 MyApp *myApp = new MyApp();
-phone->installApp(myApp);
+ESP_ERROR_CHECK(phone->installApp(myApp));
 ```
+
+**App Structure Best Practices**:
+- Place app code in `components/phone_apps/<your_app>/`
+- Include a CMakeLists.txt for the component
+- Add app icon assets (112x112 PNG for 480x800 display)
+- Use `Config` struct for automatic resource management
+- Implement `run()`, `back()`, `close()`, `pause()`, and `resume()` methods
 
 ### Available UI Components
 - **App Launcher**: Home screen with app icons
