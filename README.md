@@ -6,11 +6,13 @@ A production-ready phone interface using ESP-Brookesia framework on the JC4880P4
 
 - ✨ **Complete Phone UI**: App launcher, navigation bar, status bar, and recents screen
 - 📱 **480x800 Native Display**: Optimized dark theme stylesheet
+- 🧮 **Calculator App**: Full-featured calculator with snapshot support for app lifecycle
 - 👆 **Touch Support**: GT911 capacitive touch controller with explicit device configuration
-- 🎨 **LVGL 9.2.2**: Hardware-accelerated graphics with software rotation
+- 🎨 **LVGL 9.2.2**: Hardware-accelerated graphics with PSRAM memory allocation
 - 💾 **SPIFFS Storage**: Auto-formatting support for user data (4MB partition)
 - 🔧 **Production Ready**: Clean boot with zero errors/warnings
 - 🎮 **Gesture Navigation**: Swipe gestures for home, back, and app switching
+- 🚀 **Optimized Configuration**: AI framework and speaker system disabled for lean phone-only build
 
 ## 🔧 Hardware Specifications
 

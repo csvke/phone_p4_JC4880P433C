@@ -37,9 +37,9 @@ CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_CLIB_STRING=y
 CONFIG_LV_USE_CLIB_SPRINTF=y
 
-# Brookesia configuration - disable AI framework and speaker system (not needed for calculator)
-# CONFIG_ESP_BROOKESIA_ENABLE_AI_FRAMEWORK is not set
-# CONFIG_ESP_BROOKESIA_SYSTEMS_ENABLE_SPEAKER is not set
+# Brookesia configuration - disable AI framework and speaker system (not working for now)
+CONFIG_ESP_BROOKESIA_ENABLE_AI_FRAMEWORK=n
+CONFIG_ESP_BROOKESIA_SYSTEMS_ENABLE_SPEAKER=n
 
 # Fonts and demos for Brookesia
 CONFIG_LV_FONT_MONTSERRAT_16=y
