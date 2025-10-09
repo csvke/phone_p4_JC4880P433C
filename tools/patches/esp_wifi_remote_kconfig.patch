@@ -1,0 +1,28 @@
+--- managed_components/espressif__esp_wifi_remote/Kconfig.orig	2025-10-09 00:00:00
++++ managed_components/espressif__esp_wifi_remote/Kconfig	2025-10-09 00:00:00
+@@ -5,8 +5,12 @@
+         default n if ESP_HOST_WIFI_ENABLED
+ 
+     if ESP_WIFI_REMOTE_ENABLED
+-        orsource "./idf_v$ESP_IDF_VERSION/Kconfig.slave_select.in"
+-        orsource "./idf_v$ESP_IDF_VERSION/Kconfig.soc_wifi_caps.in"
++        # PATCH: $ESP_IDF_VERSION expansion not working in orsource, hardcode IDF 5.5 paths
++        orsource "./idf_v5.5.1/Kconfig.slave_select.in"
++        orsource "./idf_v5.5/Kconfig.slave_select.in"
++        # Fallback to 5.5 if 5.5.1 doesn't exist
++        orsource "./idf_v5.5.1/Kconfig.soc_wifi_caps.in"
++        orsource "./idf_v5.5/Kconfig.soc_wifi_caps.in"
+         orsource "./Kconfig.rpc.in"
+ 
+         config ESP_WIFI_REMOTE_EAP_ENABLED
+@@ -18,7 +22,9 @@
+                 This allows remote control of EAP authentication functions.
+ 
+         menu "Wi-Fi configuration"
+-            orsource "./idf_v$ESP_IDF_VERSION/Kconfig.wifi.in"
++            # PATCH: $ESP_IDF_VERSION expansion not working in orsource, hardcode IDF 5.5 paths
++            orsource "./idf_v5.5.1/Kconfig.wifi.in"
++            orsource "./idf_v5.5/Kconfig.wifi.in"
+         endmenu
+     endif
+     if !ESP_WIFI_REMOTE_ENABLED

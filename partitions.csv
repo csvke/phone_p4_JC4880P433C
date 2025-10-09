@@ -1,10 +1,15 @@
 # Name,   Type, SubType, Offset,  Size, Flags
- nvs,      data, nvs,     0x9000,  0x6000,
- phy_init, data, phy,     0xf000,  0x1000,
- factory,  app,  factory, ,        0x700000,
- storage,  data, spiffs,  ,        0x400000,
+# Note: if you change the phy_init or app partition offset, make sure to change the offset in Kconfig.projbuild
+# Balanced partition layout for 16MB flash with WiFi and Brookesia assets
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 6M,
+storage,  data, spiffs,  ,        3M,
 
-# Brookesia asset partitions (adjusted for actual asset size)
- anim_emotion, data, , , 0x200000
- anim_boot,    data, , , 0x100000
- anim_icon,    data, , , 0x180000
+# Brookesia asset partitions (optimized for 16MB)
+# 1.5MB for emotion animations (reduced from 1.875MB)
+ anim_emotion, data, , , 0x180000
+# 800KB for boot animation (reduced from 1MB)
+ anim_boot,    data, , , 0xC8000
+# 1.2MB for icon assets (reduced from 1.5MB)
+ anim_icon,    data, , , 0x130000

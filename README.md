@@ -1,6 +1,34 @@
 # ESP32-P4 Brookesia Phone UI for JC4880P433C
 
-A production-ready phone interface using ESP-Brookesia framework on the JC4880P433C development board with ESP32-P4.
+A production-ready phone interface with **WiFi support** using ESP-Brookesia framework on the JC4880P433C development board with ESP32-P4 + ESP32-C6 co-processor.
+
+## ⚡ Quick Start (TL;DR)
+
+```bash
+# 1. Clone and setup
+git clone --recursive https://github.com/csvke/phone_p4_JC4880P433C.git
+cd phone_p4_JC4880P433C
+source ~/esp/esp-idf/export.sh
+
+# 2. Apply WiFi patch
+idf.py reconfigure
+python3 tools/apply_patch.py \
+  --patch tools/patches/esp_wifi_remote_kconfig.patch \
+  --target managed_components/espressif__esp_wifi_remote
+
+# 3. Build and flash P4
+idf.py build flash monitor -p /dev/cu.usbmodem1101
+
+# 4. Flash C6 WiFi firmware (one-time setup)
+# Connect C6_IO9 to GND, power cycle, then:
+idf.py -C managed_components/espressif__esp_hosted/slave/ \
+       -B build_slave set-target esp32c6
+idf.py -C managed_components/espressif__esp_hosted/slave/ \
+       -B build_slave build flash monitor -p /dev/cu.wchusbserial575C0150151
+# Remove GND connection and reboot
+
+# 5. Use WiFi in Settings app!
+```
 
 ## 🎯 Features
 
@@ -40,29 +68,104 @@ A production-ready phone interface using ESP-Brookesia framework on the JC4880P4
 - [ESP-IDF v5.5.1](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32p4/get-started/index.html)
 - ESP32-P4 development environment configured
 - JC4880P433C board with USB connection
+- Python `patch` package: `pip install patch` (for WiFi setup)
 
 ### Build and Flash
 
-1. **Clone the repository**:
+#### 1. Clone the Repository
 ```bash
 git clone --recursive https://github.com/csvke/phone_p4_JC4880P433C.git
 cd phone_p4_JC4880P433C
 ```
 
-2. **Set up ESP-IDF environment**:
+#### 2. Set Up ESP-IDF Environment
 ```bash
 source ~/esp/esp-idf/export.sh  # Adjust path to your ESP-IDF installation
 ```
 
-3. **Build the project**:
+#### 3. Apply esp_wifi_remote Patch (Required for WiFi)
+```bash
+# First build will download esp_wifi_remote to managed_components
+idf.py reconfigure
+
+# Apply the Kconfig patch to fix ESP-IDF 5.5.1 compatibility
+python3 tools/apply_patch.py \
+  --patch tools/patches/esp_wifi_remote_kconfig.patch \
+  --target managed_components/espressif__esp_wifi_remote
+```
+
+**Why this patch?** The `esp_wifi_remote` component has a bug where `$ESP_IDF_VERSION` variable expansion doesn't work in `orsource` directives, preventing proper Kconfig loading for ESP-IDF 5.5.1. This patch hardcodes the IDF 5.5 paths as a workaround.
+
+#### 4. Build the Project
 ```bash
 idf.py build
 ```
 
-4. **Flash to device**:
+#### 5. Flash P4 Firmware
 ```bash
-idf.py flash monitor
+idf.py flash monitor -p /dev/cu.usbmodem1101  # Adjust port as needed
 ```
+
+## 📡 WiFi Setup (ESP32-C6 Co-Processor)
+
+The JC4880P433C board uses an **ESP32-C6** as a WiFi co-processor communicating with the ESP32-P4 via SDIO. You need to flash the ESP-Hosted slave firmware to the C6.
+
+### Hardware Connections
+
+The C6 UART is accessible via **expansion header** pins:
+
+| Signal | Expansion Pin | Description |
+|--------|--------------|-------------|
+| **C6_U0RXD** | Pin 20 | C6 UART RX (connect to USB-Serial TX) |
+| **C6_U0TXD** | Pin 21 | C6 UART TX (connect to USB-Serial RX) |
+| **C6_IO9** | Connect to GND | Boot mode pin (hold LOW for flashing) |
+| **GND** | Pins 5, 6, 15, or 16 | Common ground |
+
+### Flash C6 Firmware
+
+#### 1. Configure C6 Target
+```bash
+idf.py -C managed_components/espressif__esp_hosted/slave/ \
+       -B build_slave \
+       set-target esp32c6
+```
+
+#### 2. Enter C6 Download Mode
+1. **Connect** C6_IO9 (expansion header) to GND (use pins 5, 6, 15, or 16)
+2. **Power cycle** the board (unplug and replug USB)
+3. **Verify** the C6 UART shows "waiting for download" message
+4. **Keep IO9 grounded** during flashing
+
+#### 3. Build and Flash C6 Firmware
+```bash
+idf.py -C managed_components/espressif__esp_hosted/slave/ \
+       -B build_slave \
+       build flash monitor -p /dev/cu.wchusbserial575C0150151  # External USB-Serial port
+```
+
+**Note**: Use an **external USB-Serial adapter** connected to the expansion header pins (C6_U0RXD/TXD), NOT the main USB port which is connected to P4.
+
+#### 4. Verify C6 Firmware
+After rebooting (disconnect IO9 from GND and power cycle), you should see:
+
+```
+I (441) co-pro-main: *********************************************************************
+I (444) co-pro-main:                 ESP-Hosted-MCU Slave FW version :: 2.5.10
+I (453) co-pro-main:                 Transport used :: SDIO only
+I (460) co-pro-main: *********************************************************************
+I (468) SDIO_SLAVE: Using SDIO interface
+I (472) SDIO_SLAVE: sdio_init: sending mode: SDIO_SLAVE_SEND_PACKET
+I (478) SDIO_SLAVE: sdio_init: ESP32-C6 SDIO DriverTxQ[20] timing[0]
+```
+
+**Version Note**: The slave firmware version shown (2.5.10) may differ from the component version. This is the C6 firmware protocol version.
+
+### WiFi Connection
+Once both P4 and C6 are flashed:
+1. Launch the **Settings** app from the phone UI
+2. Navigate to **WiFi** settings
+3. Scan for available networks
+4. Connect to your WiFi network
 
 ### Local BSP Development (Optional)
 
@@ -337,4 +440,28 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ---
 
-**Status**: ✅ Production Ready | **Last Updated**: October 6, 2025
+## 🔍 Troubleshooting WiFi
+
+### C6 Not Entering Download Mode
+- Ensure C6_IO9 is properly grounded during power-on
+- Try different GND pins (5, 6, 15, or 16)
+- Verify USB-Serial adapter connections (TX↔RX, RX↔TX)
+
+### C6 Firmware Not Responding
+- Check SDIO connections between P4 and C6 (internal, no user action needed)
+- Verify C6 shows "SDIO_SLAVE" in boot log
+- Ensure timing[0] is shown (not timing[1])
+
+### WiFi Scan Not Working
+- Verify C6 firmware version is 2.5.10 or compatible
+- Check P4 logs for "Received INIT event from ESP32 peripheral"
+- Ensure Settings app is properly installed
+
+### Patch Application Failed
+- Install Python patch package: `pip install patch`
+- Ensure `idf.py reconfigure` was run first to download esp_wifi_remote
+- Check that managed_components/espressif__esp_wifi_remote exists
+
+---
+
+**Status**: ✅ Production Ready with WiFi | **Last Updated**: October 9, 2025

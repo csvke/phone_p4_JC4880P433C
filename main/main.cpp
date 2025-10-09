@@ -9,6 +9,7 @@
 #include "esp_brookesia.hpp"
 #include "systems/phone/stylesheets/480_800/dark/stylesheet.hpp"
 #include "Calculator.hpp"
+#include "Settings.hpp"
 
 // Suppress missing field initializer warnings for ESP-Brookesia structures
 #pragma GCC diagnostic push
@@ -94,6 +95,11 @@ extern "C" void app_main(void)
     static std::shared_ptr<phone_apps::Calculator> calculator = std::make_shared<phone_apps::Calculator>();
     assert(phone->getManager().installApp(calculator.get()) && "Install Calculator app failed");
     ESP_LOGI(TAG, "Calculator app installed successfully");
+
+    // Install Settings app (provides WiFi management)
+    static std::shared_ptr<AppSettings> settings = std::make_shared<AppSettings>();
+    assert(phone->getManager().installApp(settings.get()) && "Install Settings app failed");
+    ESP_LOGI(TAG, "Settings app installed successfully");
 
     ESP_LOGI(TAG, "setup done");
     bsp_display_unlock();

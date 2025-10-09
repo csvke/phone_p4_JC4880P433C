@@ -33,6 +33,7 @@ Thumbs.db
 # Logs
 *.log
 build/
+build_slave/
 
 # ESP-IDF specific
 sdkconfig.old
@@ -46,3 +47,6 @@ demo/*/sdkconfig*
 # Temporary files
 *.tmp
 *.bak
+
+# Modified managed components (use patch workflow instead)
+components/espressif__esp_wifi_remote/

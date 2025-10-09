@@ -25,6 +25,12 @@ dependencies:
     git: "https://github.com/csvke/esp32_p4_jc4880p433c_bsp.git"
   
   # ========================================
+  # WIFI & CONNECTIVITY (ESP32-C6 Co-processor via ESP-Hosted)
+  # ========================================
+  espressif/esp_wifi_remote: "~1.1.4"  # WiFi Remote 1.1.4 with IDF version-specific Kconfigs (REQUIRED for slave target selection)
+  espressif/esp_hosted: "~2.5.4"      # ESP-Hosted 2.0.16: Match manufacturer's known-working version for C6 compatibility
+  
+  # ========================================
   # AUDIO & MEDIA FEATURES (Currently Enabled)
   # ========================================
   esp_codec_dev: "1.2.*"                  # Audio codec device abstraction
