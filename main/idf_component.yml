@@ -21,8 +21,11 @@ dependencies:
   # ========================================
   # HARDWARE BOARD SUPPORT PACKAGE
   # ========================================
+  # NOTE: Using local BSP repository with camera support
+  #       Repository location: ~/JC4880P443C/esp32_p4_jc4880p433c_bsp
   csvke/esp32_p4_jc4880p433c_bsp:          # JC4880P433C board support package
-    git: "https://github.com/csvke/esp32_p4_jc4880p433c_bsp.git"
+    version: "*"
+    override_path: ../../esp32_p4_jc4880p433c_bsp
   
   # ========================================
   # WIFI & CONNECTIVITY (ESP32-C6 Co-processor via ESP-Hosted)
@@ -34,7 +37,7 @@ dependencies:
   # AUDIO & MEDIA FEATURES (Currently Enabled)
   # ========================================
   esp_codec_dev: "1.2.*"                  # Audio codec device abstraction
-  espressif/esp_video: "*"                # Video processing framework
+  # espressif/esp_video: "*"                # Video processing framework - Using local esp-video-components instead
   espressif/avi_player: "^2.0.0"          # AVI video player component
   
   # ========================================
@@ -45,9 +48,24 @@ dependencies:
   # chmorgan/esp-libhelix-mp3: "*"        # MP3 decoder using Helix library
   
   # ========================================
-  # CAMERA & COMPUTER VISION APPS
+  # CAMERA & COMPUTER VISION
   # ========================================
-  # espressif/esp_cam_sensor: "*"         # Camera sensor drivers (OV2640, OV3660, etc.)
+  # NOTE: Using local esp-video-components repository instead of managed component
+  #       Repository location: ~/JC4880P443C/esp-video-components
+  #       Includes custom OV02C10 sensor driver
+  # Local overrides to use esp-video-components from ~/JC4880P443C/
+  esp_sccb_intf:
+    version: "*"
+    override_path: ../../esp-video-components/esp_sccb_intf
+  esp_cam_sensor:
+    version: "*"
+    override_path: ../../esp-video-components/esp_cam_sensor
+  esp_video:
+    version: "*"
+    override_path: ../../esp-video-components/esp_video
+  esp_ipa:
+    version: "*"
+    override_path: ../../esp-video-components/esp_ipa
   # espressif/usb_host_uvc: "*"           # USB camera support (UVC protocol)
   
   # AI/ML Model Components (Uncomment for AI apps):

@@ -1,15 +1,27 @@
+// ESP-IDF headers (most are already C++ compatible)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_task_wdt.h"
+#include "driver/gpio.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
+#include "bsp/camera.h"
+#include "esp_cam_sensor.h"
+
+// Video component headers need explicit C linkage
+extern "C" {
+    #include "esp_sccb_i2c.h"
+    #include "ov02c10.h"
+}
+
 #include "esp_brookesia.hpp"
 #include "systems/phone/stylesheets/480_800/dark/stylesheet.hpp"
 #include "Calculator.hpp"
 #include "Settings.hpp"
+#include "Camera.hpp"
 
 // Suppress missing field initializer warnings for ESP-Brookesia structures
 #pragma GCC diagnostic push
@@ -101,8 +113,14 @@ extern "C" void app_main(void)
     assert(phone->getManager().installApp(settings.get()) && "Install Settings app failed");
     ESP_LOGI(TAG, "Settings app installed successfully");
 
+    // Install Camera app (MIPI-CSI video preview)
+    static std::shared_ptr<Camera> camera = std::make_shared<Camera>(BSP_LCD_H_RES, BSP_LCD_V_RES);
+    assert(phone->getManager().installApp(camera.get()) && "Install Camera app failed");
+    ESP_LOGI(TAG, "Camera app installed successfully");
+
     ESP_LOGI(TAG, "setup done");
     bsp_display_unlock();
 }
 
 #pragma GCC diagnostic pop
+
