@@ -9,6 +9,7 @@
 #include "esp_err.h"
 #include "esp_check.h"
 #include "esp_video_init.h"
+#include "esp_video_device.h"
 #include "esp_lvgl_port.h"
 #include "linux/videodev2.h"
 #include <fcntl.h>
@@ -25,6 +26,12 @@ static const char *TAG = "Camera";
 #define VIDEO_DEVICE "/dev/video0"
 #define BUFFER_COUNT 3
 #define CANVAS_UPDATE_PERIOD_MS 33  // ~30 FPS
+
+// Software debayering helper (Bayer GRBG -> RGB565)
+// OV02C10 outputs RAW10 GRBG Bayer pattern
+inline uint16_t rgb888_to_rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
 
 // Camera icon (will be created manually or imported from assets)
 LV_IMG_DECLARE(img_app_camera);
@@ -47,8 +54,8 @@ Camera::Camera(uint16_t hor_res, uint16_t ver_res) :
             .app_launcher_page_index = 0,
             .status_icon_area_index = 0,
             .status_icon_data = {},
-            .status_bar_visual_mode = esp_brookesia::systems::phone::StatusBar::VisualMode::SHOW_FIXED,
-            .navigation_bar_visual_mode = esp_brookesia::systems::phone::NavigationBar::VisualMode::SHOW_FIXED,
+            .status_bar_visual_mode = esp_brookesia::systems::phone::StatusBar::VisualMode::HIDE,
+            .navigation_bar_visual_mode = esp_brookesia::systems::phone::NavigationBar::VisualMode::HIDE,
             .flags = {
                 .enable_status_icon_common_size = 0,
                 .enable_navigation_gesture = 1,
@@ -155,23 +162,14 @@ bool Camera::run(void)
             return false;
         }
         
-        ESP_LOGI(TAG, "Current camera format: %ux%u, fourcc=0x%08x ('%c%c%c%c')", 
+        ESP_LOGI(TAG, "Camera format: %ux%u, fourcc=0x%08x ('%c%c%c%c')", 
                  fmt.fmt.pix.width, fmt.fmt.pix.height, fmt.fmt.pix.pixelformat,
                  (fmt.fmt.pix.pixelformat >> 0) & 0xFF,
                  (fmt.fmt.pix.pixelformat >> 8) & 0xFF,
                  (fmt.fmt.pix.pixelformat >> 16) & 0xFF,
                  (fmt.fmt.pix.pixelformat >> 24) & 0xFF);
         
-        // Request RGB565 format (will use ISP to debayer if camera outputs raw Bayer)
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
-        // Keep resolution, just change pixel format
-        
-        if (ioctl(_video_fd, VIDIOC_S_FMT, &fmt) < 0) {
-            ESP_LOGW(TAG, "Failed to set RGB565 format, will use current format");
-        } else {
-            ESP_LOGI(TAG, "Set camera format to: %ux%u, RGB565", 
-                     fmt.fmt.pix.width, fmt.fmt.pix.height);
-        }
+        ESP_LOGI(TAG, "ISP automatically converts RAW10 to RGB565 ('RGBP') - direct display!");
     }
 
     // Get screen and visual area
@@ -182,13 +180,14 @@ bool Camera::run(void)
     
     ESP_LOGI(TAG, "Visual area: %dx%d", width, height);
 
-    // Create fullscreen container
+    // Create fullscreen container (no scrolling)
     lv_obj_t *cont = lv_obj_create(screen);
     lv_obj_set_size(cont, width, height);
     lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_pad_all(cont, 0, 0);
     lv_obj_set_style_border_width(cont, 0, 0);
     lv_obj_set_style_bg_color(cont, lv_color_black(), 0);
+    lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLLABLE);  // Disable scrolling
 
     // Create canvas for video display
     _canvas = lv_canvas_create(cont);
@@ -342,11 +341,68 @@ void Camera::videoStreamTask(void *app)
             // Update canvas with new frame
             uint8_t *frame_data = self->_video_buffers[buf.index];
             
-            // Copy frame to canvas buffer (assuming RGB565 format)
             lv_draw_buf_t *canvas_buf = lv_canvas_get_draw_buf(self->_canvas);
             if (canvas_buf != nullptr && canvas_buf->data != nullptr) {
-                memcpy(canvas_buf->data, frame_data, 
-                       self->_hor_res * self->_ver_res * sizeof(lv_color_t));
+                // CRITICAL DISCOVERY: ISP is already converting RAW10 to RGB565!
+                // Buffer size: 1875328 bytes = 1288×728×2 (RGB565)
+                // We just need to downscale and copy the RGB565 data directly!
+                
+                uint16_t *frame_rgb565 = (uint16_t *)frame_data;
+                uint16_t *canvas_rgb565 = (uint16_t *)canvas_buf->data;
+                
+                // Camera: 1288x728, RGB565 (2 bytes per pixel)
+                int cam_width = 1288;
+                int cam_height = 728;
+                
+                // Debug: log first few RGB565 pixels (only once)
+                static int frame_count = 0;
+                if (frame_count++ == 0) {
+                    ESP_LOGI(TAG, "ISP output is RGB565! Buffer=%zu bytes, first 4 pixels:", buf.bytesused);
+                    for (int i = 0; i < 4; i++) {
+                        ESP_LOGI(TAG, "  pixel[%d] = 0x%04x", i, frame_rgb565[i]);
+                    }
+                }
+                
+                int out_width = self->_hor_res;
+                int out_height = self->_ver_res;
+                
+                // Calculate proper aspect ratio scaling
+                // Camera: 1288x728 = 1.77:1 aspect ratio
+                // Display: 480x696 = 0.69:1 aspect ratio (portrait)
+                // We need to crop the camera feed to fit without stretching
+                
+                float cam_aspect = (float)cam_width / cam_height;  // 1.77
+                float display_aspect = (float)out_width / out_height;  // 0.69
+                
+                int src_w, src_h, src_x_offset, src_y_offset;
+                
+                if (cam_aspect > display_aspect) {
+                    // Camera is wider - crop sides (fit height)
+                    src_h = cam_height;
+                    src_w = (int)(cam_height * display_aspect);
+                    src_x_offset = (cam_width - src_w) / 2;  // Center horizontally
+                    src_y_offset = 0;
+                } else {
+                    // Camera is taller - crop top/bottom (fit width)
+                    src_w = cam_width;
+                    src_h = (int)(cam_width / display_aspect);
+                    src_x_offset = 0;
+                    src_y_offset = (cam_height - src_h) / 2;  // Center vertically
+                }
+                
+                // Scale from cropped region to canvas
+                float x_ratio = (float)src_w / out_width;
+                float y_ratio = (float)src_h / out_height;
+                
+                for (int y = 0; y < out_height; y++) {
+                    for (int x = 0; x < out_width; x++) {
+                        int src_x = src_x_offset + (int)(x * x_ratio);
+                        int src_y = src_y_offset + (int)(y * y_ratio);
+                        
+                        // Direct copy of RGB565 pixel from ISP output
+                        canvas_rgb565[y * out_width + x] = frame_rgb565[src_y * cam_width + src_x];
+                    }
+                }
                 
                 // Invalidate canvas to trigger redraw
                 lv_obj_invalidate(self->_canvas);
