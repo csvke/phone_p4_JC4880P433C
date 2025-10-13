@@ -1,9 +1,9 @@
 ## Camera App Component Manifest
 ## ESP32-P4 Camera Application for ESP-Brookesia Phone System
 
-version: 1.0.0
+version: 0.2.0
 
-description: "Live camera preview and photo capture app for ESP32-P4 with OV02C10 sensor"
+description: "Live camera preview and photo capture app for ESP32-P4 with OV02C10 sensor (v0.2.0: ESP Video Components with ISP pipeline)"
 
 dependencies:
   idf: ">=5.5.1"
