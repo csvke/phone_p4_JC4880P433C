@@ -108,7 +108,25 @@ bool CameraCsi::back(void)
 // Handle init
 bool CameraCsi::init(void)
 {
-    ESP_LOGI(TAG, "� Camera app init called");
+    ESP_LOGI(TAG, "📷 Camera app init called");
+    return true;
+}
+
+// Handle close - called when app is being closed/killed
+bool CameraCsi::close(void)
+{
+    ESP_LOGI(TAG, "Camera app close called - stopping camera preview");
+    
+    // Stop camera preview if running to prevent crashes
+    if (camera_preview_is_running()) {
+        ESP_LOGI(TAG, "Stopping camera preview before app close...");
+        camera_preview_stop();
+        ESP_LOGI(TAG, "Camera preview stopped successfully");
+    }
+    
+    // Call deinit to clean up all resources
+    camera_preview_deinit();
+    
     return true;
 }
 

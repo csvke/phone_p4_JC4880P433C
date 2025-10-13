@@ -44,6 +44,14 @@ bool camera_preview_is_running(void);
  */
 void camera_preview_set_parent(lv_obj_t *parent);
 
+/**
+ * @brief Deinitialize and cleanup all camera preview resources
+ * 
+ * Stops preview, unmaps buffers, closes video device, and cleans up LVGL objects.
+ * Should be called before app exits or during cleanup.
+ */
+void camera_preview_deinit(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -14,6 +14,8 @@
 #include <sys/mman.h>
 #include <sys/errno.h>
 #include <errno.h>
+#include <string.h>
+#include <sys/poll.h>
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_err.h"
@@ -113,11 +115,13 @@ static esp_err_t setup_video_device(void)
     ESP_LOGI(TAG, "Setting up video device...");
     
     // Open MIPI CSI video device (O_RDWR required for ioctl operations)
-    video_fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR);
+    video_fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR | O_NONBLOCK);
     if (video_fd < 0) {
         ESP_LOGE(TAG, "Failed to open video device: %s", ESP_VIDEO_MIPI_CSI_DEVICE_NAME);
         return ESP_FAIL;
     }
+    
+    ESP_LOGI(TAG, "Video device opened in non-blocking mode");
     
     // Get the default format configured by sdkconfig
     struct v4l2_format default_format = {
@@ -268,8 +272,19 @@ static void preview_task(void *pvParameters)
         ESP_LOGI(TAG, "Video stream started");
     }
     
+    TickType_t last_update = xTaskGetTickCount();
+    const TickType_t update_interval = pdMS_TO_TICKS(PREVIEW_UPDATE_RATE_MS);
+    uint32_t frame_count = 0;
+    
     while (preview_running) {
-        // Dequeue frame buffer with timeout
+        // Check flags at the start of every iteration
+        if (!stream_started || !preview_running || video_fd < 0) {
+            ESP_LOGI(TAG, "Stream stopped externally (stream_started=%d, preview_running=%d, video_fd=%d)", 
+                     stream_started, preview_running, video_fd);
+            break;
+        }
+        
+        // Try to dequeue frame (non-blocking mode)
         struct v4l2_buffer buf = {
             .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
             .memory = V4L2_MEMORY_MMAP,
@@ -278,45 +293,82 @@ static void preview_task(void *pvParameters)
         int ret = ioctl(video_fd, VIDIOC_DQBUF, &buf);
         if (ret == 0) {
             // Copy frame data to LVGL canvas
-            if (draw_buf && video_buffers[buf.index]) {
+            // Check all pointers before dereferencing to avoid crashes if objects are freed
+            if (draw_buf && draw_buf->data && video_buffers[buf.index] && preview_canvas) {
                 uint32_t copy_size = buf.bytesused;
                 if (copy_size > draw_buf->data_size) {
                     copy_size = draw_buf->data_size;
                 }
                 
                 // Copy RGB565 data directly to draw buffer
+                // For large copies, this can take time, so yield periodically
                 memcpy(draw_buf->data, video_buffers[buf.index], copy_size);
                 
-                // Update canvas (this will trigger display refresh)
-                lv_obj_invalidate(preview_canvas);
+                // Yield after memcpy to allow other tasks to run
+                vTaskDelay(1);
+                
+                // Update canvas with LVGL lock to prevent blocking other tasks
+                // Double-check canvas pointer before LVGL operations
+                if (preview_canvas && lvgl_port_lock(10)) {  // 10ms timeout
+                    // Check again after acquiring lock in case it was deleted
+                    if (preview_canvas) {
+                        lv_obj_invalidate(preview_canvas);
+                    }
+                    lvgl_port_unlock();
+                }
+                
+                frame_count++;
             }
             
             // Re-queue the buffer
             if (ioctl(video_fd, VIDIOC_QBUF, &buf) != 0) {
                 ESP_LOGE(TAG, "Failed to re-queue buffer %d", buf.index);
             }
-        } else {
-            // DQBUF failed - likely no frame available yet
-            if (errno != EAGAIN) {
-                ESP_LOGE(TAG, "DQBUF error: %d", errno);
+            
+            // Throttle update rate and ensure IDLE task gets time
+            TickType_t now = xTaskGetTickCount();
+            TickType_t elapsed = now - last_update;
+            if (elapsed < update_interval) {
+                // Sleep for the remaining time to maintain frame rate
+                vTaskDelay(update_interval - elapsed);
+            } else {
+                // Even if we're behind, yield to let IDLE task run
+                vTaskDelay(2);
             }
-            // Small delay to avoid spinning
-            vTaskDelay(pdMS_TO_TICKS(10));
+            last_update = xTaskGetTickCount();
+        } else {
+            // DQBUF failed in non-blocking mode
+            if (errno == EAGAIN) {
+                // No frame ready yet - delay briefly and loop will check flags again
+                // Use shorter delay (10ms) to ensure we check stop flags frequently
+                vTaskDelay(pdMS_TO_TICKS(10));
+            } else if (errno == EINTR) {
+                // Interrupted, just retry immediately
+                vTaskDelay(1);
+            } else if (errno == EBADF || errno == EINVAL) {
+                // Bad file descriptor or invalid request - fd was closed or stream stopped
+                ESP_LOGI(TAG, "DQBUF failed (fd closed or stream stopped): errno=%d (%s)", errno, strerror(errno));
+                break;
+            } else {
+                // Other error - log and exit
+                ESP_LOGI(TAG, "DQBUF error: ret=%d, errno=%d (%s) - exiting", ret, errno, strerror(errno));
+                break;
+            }
         }
-        
-        // Feed the watchdog
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
     
-    // Stop video streaming
-    if (stream_started) {
+    // Stop video streaming (if not already stopped by stop function)
+    if (stream_started && video_fd >= 0) {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(video_fd, VIDIOC_STREAMOFF, &type);
         stream_started = false;
-        ESP_LOGI(TAG, "Video stream stopped");
+        ESP_LOGI(TAG, "Video stream stopped (from task)");
     }
     
     ESP_LOGI(TAG, "Preview task ended");
+    
+    // Clear handle before deleting to signal completion
+    preview_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -337,15 +389,26 @@ esp_err_t camera_preview_start(void)
     // Initialize video system if not done
     if (!camera_initialized) {
         ESP_RETURN_ON_ERROR(init_video_system(), TAG, "Video system init failed");
-        ESP_RETURN_ON_ERROR(setup_video_device(), TAG, "Video device setup failed");
-        ESP_RETURN_ON_ERROR(init_preview_display(), TAG, "Preview display init failed");
         camera_initialized = true;
     }
     
-    // Start preview task
+    // Always setup video device (reopen if it was closed)
+    // This MUST come before init_preview_display because it sets camera_width/height
+    if (video_fd < 0) {
+        ESP_RETURN_ON_ERROR(setup_video_device(), TAG, "Video device setup failed");
+    }
+    
+    // Initialize display after we have camera dimensions
+    if (preview_canvas == NULL) {
+        ESP_RETURN_ON_ERROR(init_preview_display(), TAG, "Preview display init failed");
+    }
+    
+    // Start preview task with lower priority to not block other tasks
+    // Don't pin to specific core - let FreeRTOS scheduler balance the load
     preview_running = true;
     BaseType_t task_ret = xTaskCreate(preview_task, "camera_preview", 8192, NULL, 
-                                     tskIDLE_PRIORITY + 2, &preview_task_handle);
+                                     tskIDLE_PRIORITY + 1,  // Lower priority than most tasks
+                                     &preview_task_handle);
     
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create preview task");
@@ -368,14 +431,42 @@ esp_err_t camera_preview_stop(void)
     
     ESP_LOGI(TAG, "Stopping camera preview...");
     
-    // Signal task to stop
+    // Stop video streaming FIRST to unblock DQBUF
+    if (stream_started && video_fd >= 0) {
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ioctl(video_fd, VIDIOC_STREAMOFF, &type);
+        stream_started = false;
+        ESP_LOGI(TAG, "Video stream stopped (from stop function)");
+        
+        // Close the video fd to force DQBUF to fail immediately
+        // This will unblock any pending ioctl calls
+        close(video_fd);
+        video_fd = -1;
+        ESP_LOGI(TAG, "Video device closed to unblock task");
+    }
+    
+    // Now signal task to stop
     preview_running = false;
     
-    // Wait for task to finish
+    // Wait for task to finish with timeout
     if (preview_task_handle) {
-        // Task will delete itself
+        // Give task time to finish (up to 500ms should be enough now)
+        int timeout_ms = 500;
+        while (preview_task_handle != NULL && timeout_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            timeout_ms -= 10;
+        }
+        
+        if (preview_task_handle != NULL) {
+            ESP_LOGW(TAG, "Preview task did not finish in time, force cleanup");
+            // Task is stuck, we need to move on
+        }
+        
         preview_task_handle = NULL;
     }
+    
+    // Small delay to ensure cleanup completes
+    vTaskDelay(pdMS_TO_TICKS(50));
     
     ESP_LOGI(TAG, "Camera preview stopped");
     return ESP_OK;
@@ -396,8 +487,17 @@ void camera_preview_deinit(void)
 {
     ESP_LOGI(TAG, "Cleaning up camera preview resources...");
     
-    // Stop preview first
+    // Stop preview first - this will stop the task
     camera_preview_stop();
+    
+    // Set LVGL pointers to NULL immediately to prevent task from using them
+    lv_obj_t *canvas_temp = preview_canvas;
+    lv_draw_buf_t *buf_temp = draw_buf;
+    preview_canvas = NULL;
+    draw_buf = NULL;
+    
+    // Give task time to see the NULL pointers and exit
+    vTaskDelay(pdMS_TO_TICKS(50));
     
     // Unmap video buffers
     for (int i = 0; i < CAMERA_BUFFER_COUNT; i++) {
@@ -413,15 +513,13 @@ void camera_preview_deinit(void)
         video_fd = -1;
     }
     
-    // Clean up LVGL objects
-    if (draw_buf) {
-        lv_draw_buf_destroy(draw_buf);
-        draw_buf = NULL;
+    // Clean up LVGL objects after task has stopped
+    if (buf_temp) {
+        lv_draw_buf_destroy(buf_temp);
     }
     
-    if (preview_canvas) {
-        lv_obj_delete(preview_canvas);
-        preview_canvas = NULL;
+    if (canvas_temp) {
+        lv_obj_delete(canvas_temp);
     }
     
     // Deinitialize video system

@@ -20,6 +20,7 @@ public:
     bool run(void) override;
     bool back(void) override;
     bool init(void) override;
+    bool close(void) override;  // Override close to stop camera before app exits
 
 public:
     // UI references (for cleanup only)
