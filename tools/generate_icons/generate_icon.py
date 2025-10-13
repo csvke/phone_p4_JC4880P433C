@@ -6,10 +6,13 @@ This script downloads Material Design Icons (MDI) from pictogrammers.com
 and converts them to LVGL9-compatible C code with ARGB8888 format.
 Optimized for ESP-Brookesia phone apps with 112x112 pixel default size.
 
-Default appearance:
+Default behavior:
 - Icon graphics: White (#FFFFFF)
 - Background: Grey (#808080)
 - Corner radius: 12px (rounded)
+- Generated files: <appname>_app_icon.c, <appname>_app_icon.h, <appname>_app_icon_source.md
+- Metadata: Saved by default (use --no-metadata to skip)
+- Output directory: generated_icons/<appname>/
 
 Usage:
     Interactive mode (recommended):
@@ -21,8 +24,10 @@ Usage:
 Example:
     python generate_icon.py --interactive
     python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/
-    python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ --icon-color "#FFFFFF" --bg-color "#2196F3" --radius 12
-    python generate_icon.py https://pictogrammers.com/library/mdi/icon/phone/ --bg-color none --radius 0
+    # Generates: camera_app_icon.c, camera_app_icon.h, camera_app_icon_source.md
+    
+    python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ --icon-color "#FFFFFF" --bg-color "#2196F3"
+    python generate_icon.py https://pictogrammers.com/library/mdi/icon/phone/ --appname dialer --bg-color none --no-metadata
 """
 
 import argparse
@@ -411,13 +416,16 @@ def interactive_mode():
     
     suggested_name = extract_icon_name(url)
     if suggested_name:
-        name_input = input(f"Icon variable name [{suggested_name}_icon]: ").strip()
-        icon_name = name_input if name_input else f"{suggested_name}_icon"
+        name_input = input(f"App name [{suggested_name}]: ").strip()
+        app_name = name_input if name_input else suggested_name
     else:
-        icon_name = input("Icon variable name: ").strip()
-        if not icon_name:
-            print("Error: Icon name is required")
+        app_name = input("App name: ").strip()
+        if not app_name:
+            print("Error: App name is required")
             return 1
+    
+    # Generate icon variable name with _app_icon suffix
+    icon_name = f"{app_name}_app_icon"
     
     # Step 3: Icon size
     size_input = input("Icon size in pixels [112]: ").strip()
@@ -450,15 +458,15 @@ def interactive_mode():
     print("Step 3: Output Location")
     print("-" * 60)
     print("Choose output location:")
-    print("  1. Generated icons directory (./generated_icons/<icon_name>/)")
+    print(f"  1. Generated icons directory (./generated_icons/{app_name}/)")
     print("  2. Specific app's resources folder")
     print("  3. Custom path")
     
     location_choice = input("\nChoice [1]: ").strip() or "1"
     
     if location_choice == "1":
-        # Create generated_icons/<icon_name>/ directory
-        output_dir = Path("generated_icons") / icon_name
+        # Create generated_icons/<appname>/ directory
+        output_dir = Path("generated_icons") / app_name
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = str(output_dir / f"{icon_name}.c")
     elif location_choice == "2":
@@ -495,11 +503,13 @@ def interactive_mode():
         custom_path = input("Enter custom output path: ").strip()
         output_file = custom_path if custom_path else f"{icon_name}.c"
     
-    # Step 8: Generate metadata file
+    # Step 8: Generate metadata file (default: yes)
     print("\n" + "="*60)
     print("Step 4: Metadata")
     print("-" * 60)
-    save_metadata = input("Save source metadata file? [Y/n]: ").strip().lower() or 'y'
+    print("Metadata file documents icon source and generation settings.")
+    save_metadata_input = input("Save source metadata file? [Y/n]: ").strip().lower()
+    save_metadata = save_metadata_input != 'n'  # Default to True unless explicitly 'n'
     
     # Summary
     print("\n" + "="*60)
@@ -512,7 +522,7 @@ def interactive_mode():
     print(f"  Background:      {bg_color if bg_color else 'Transparent'}")
     print(f"  Corner Radius:   {radius}px")
     print(f"  Output:          {output_file}")
-    print(f"  Save Metadata:   {'Yes' if save_metadata == 'y' else 'No'}")
+    print(f"  Save Metadata:   {'Yes' if save_metadata else 'No'}")
     print("="*60 + "\n")
     
     confirm = input("Generate icon? [Y/n]: ").strip().lower() or 'y'
@@ -522,7 +532,7 @@ def interactive_mode():
     
     # Generate icon
     print("\nGenerating icon...")
-    return generate_icon(url, icon_name, size, icon_color, bg_color, radius, output_file, save_metadata == 'y')
+    return generate_icon(url, icon_name, size, icon_color, bg_color, radius, output_file, save_metadata)
 
 def generate_icon(url, icon_name, size, icon_color, bg_color, radius, output_file, save_metadata):
     """Generate icon with given parameters"""
@@ -580,17 +590,22 @@ Examples:
   Interactive mode (recommended):
     %(prog)s --interactive
   
-  Command-line mode with defaults (white icon, grey background, 12px radius):
+  Command-line mode with defaults (white icon, grey background, 12px radius, metadata saved):
     %(prog)s https://pictogrammers.com/library/mdi/icon/camera/
+    # Generates in generated_icons/camera/:
+    #   camera_app_icon.c, camera_app_icon.h, camera_app_icon_source.md
   
   Custom colors and size:
     %(prog)s https://pictogrammers.com/library/mdi/icon/phone/ --icon-color "#000000" --bg-color "#2196F3" --size 128
+    # Generates: phone_app_icon.c, phone_app_icon.h, phone_app_icon_source.md
   
-  Transparent background, no radius:
-    %(prog)s https://pictogrammers.com/library/mdi/icon/settings/ --bg-color none --radius 0
+  Transparent background, no metadata:
+    %(prog)s https://pictogrammers.com/library/mdi/icon/settings/ --bg-color none --radius 0 --no-metadata
+    # Generates: settings_app_icon.c, settings_app_icon.h (no metadata)
   
-  Full customization:
-    %(prog)s https://pictogrammers.com/library/mdi/icon/home/ --icon-color "#FFFFFF" --bg-color "#4CAF50" --radius 16 --save-metadata
+  Custom app name:
+    %(prog)s https://pictogrammers.com/library/mdi/icon/home/ --appname home --icon-color "#FFFFFF" --bg-color "#4CAF50"
+    # Generates: home_app_icon.c, home_app_icon.h, home_app_icon_source.md
         """
     )
     
@@ -600,9 +615,9 @@ Examples:
     parser.add_argument('--icon-color', type=str, default='#FFFFFF', help='Icon graphics color in hex format (default: "#FFFFFF" white)')
     parser.add_argument('--bg-color', type=str, default='#808080', help='Background color in hex format (default: "#808080" grey, use "none" for transparent)')
     parser.add_argument('--radius', type=int, default=12, help='Corner radius in pixels (default: 12 for rounded corners)')
-    parser.add_argument('--output', type=str, help='Output C file path (default: generated_icons/<icon_name>/<icon_name>.c)')
-    parser.add_argument('--name', type=str, help='Override icon variable name (default: extracted from URL)')
-    parser.add_argument('--save-metadata', action='store_true', help='Save source metadata file')
+    parser.add_argument('--output', type=str, help='Output C file path (default: generated_icons/<appname>/<appname>_app_icon.c)')
+    parser.add_argument('--appname', type=str, help='App name for the icon (default: extracted from URL, automatically gets _app_icon suffix)')
+    parser.add_argument('--no-metadata', action='store_true', help='Skip saving source metadata file (metadata saved by default)')
     
     args = parser.parse_args()
     
@@ -611,27 +626,33 @@ Examples:
         return interactive_mode()
     
     # Command-line mode
-    icon_name = args.name
+    app_name = args.appname
     output_file = args.output if args.output else None
     
-    # Extract icon name from URL
+    # Extract app name from URL
     extracted_name = extract_icon_name(args.url)
     if not extracted_name:
-        print("Error: Could not extract icon name from URL. Please specify --output or --name")
+        print("Error: Could not extract icon name from URL. Please specify --output or --appname")
         return 1
     
-    # Set icon name
-    if not icon_name:
-        icon_name = f"{extracted_name}_icon"
+    # Set app name (use extracted name if not provided)
+    if not app_name:
+        app_name = extracted_name
     
-    # If no output file specified, use generated_icons/<icon_name>/<icon_name>.c
+    # Generate icon variable name with _app_icon suffix
+    icon_name = f"{app_name}_app_icon"
+    
+    # If no output file specified, use generated_icons/<appname>/<appname>_app_icon.c
     if not output_file:
-        output_dir = Path("generated_icons") / icon_name
+        output_dir = Path("generated_icons") / app_name
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = str(output_dir / f"{icon_name}.c")
     
     # Handle "none" for transparent background
     bg_color = None if args.bg_color.lower() == 'none' else args.bg_color
+    
+    # Metadata is saved by default unless --no-metadata is specified
+    save_metadata = not args.no_metadata
     
     return generate_icon(
         args.url,
@@ -641,7 +662,7 @@ Examples:
         bg_color,
         args.radius,
         output_file,
-        args.save_metadata
+        save_metadata
     )
 
 if __name__ == '__main__':
