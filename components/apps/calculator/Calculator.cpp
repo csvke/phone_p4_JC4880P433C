@@ -10,6 +10,7 @@
 #include <vector>
 #include "esp_log.h"
 #include "Calculator.hpp"
+#include "esp_lib_utils.h"
 
 using namespace std;
 using namespace phone_apps;
@@ -37,10 +38,10 @@ Calculator::Calculator() :
             .status_icon_area_index = 0,
             .status_icon_data = {},
             .status_bar_visual_mode = esp_brookesia::systems::phone::StatusBar::VisualMode::SHOW_FIXED,
-            .navigation_bar_visual_mode = esp_brookesia::systems::phone::NavigationBar::VisualMode::SHOW_FIXED,
+            .navigation_bar_visual_mode = esp_brookesia::systems::phone::NavigationBar::VisualMode::HIDE,
             .flags = {
                 .enable_status_icon_common_size = 0,
-                .enable_navigation_gesture = 1,
+                .enable_navigation_gesture = 1,  // Use gesture for navigation
             },
         }
     )
@@ -491,4 +492,19 @@ void Calculator::keyboard_event_cb(lv_event_t *e)
             app->formula_len = strlen(history_str);
         }
     }
+}
+
+// Debug: Check if this code is being executed
+static bool __attribute__((used)) calculator_registration_debug = []() {
+    ESP_LOGI("Calculator", "Calculator app registration code is being executed");
+    return true;
+}();
+
+// Register the calculator app in the ESP-Brookesia registry
+using phone_apps::Calculator;
+ESP_UTILS_REGISTER_PLUGIN(esp_brookesia::systems::base::App, Calculator, "Calculator");
+
+// Force linking function
+extern "C" void force_calculator_app_link() {
+    // This function ensures the registrar static variable is not optimized away
 }

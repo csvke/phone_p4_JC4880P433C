@@ -1,0 +1,20 @@
+## Calculator App Component Manifest
+## Basic calculator application for ESP-Brookesia Phone System
+
+version: "1.0.0"
+description: "Simple calculator app with basic arithmetic operations"
+
+dependencies:
+  idf: ">=5.5.1"
+  
+  # Brookesia framework dependencies
+  brookesia_core:
+    version: "*"
+    override_path: "../../esp-brookesia/core/brookesia_core"
+  
+  # UI dependencies
+  lvgl/lvgl: ">=9,<10"
+  espressif/esp_lvgl_port: "^2"
+
+targets:
+  - esp32p4

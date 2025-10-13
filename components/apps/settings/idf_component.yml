@@ -1,0 +1,20 @@
+## Settings App Component Manifest
+## System settings application for ESP-Brookesia Phone System
+
+version: "1.0.0"
+description: "System settings and configuration app"
+
+dependencies:
+  idf: ">=5.5.1"
+  
+  # Brookesia framework dependencies
+  brookesia_core:
+    version: "*"
+    override_path: "../../esp-brookesia/core/brookesia_core"
+  
+  # UI dependencies
+  lvgl/lvgl: ">=9,<10"
+  espressif/esp_lvgl_port: "^2"
+
+targets:
+  - esp32p4

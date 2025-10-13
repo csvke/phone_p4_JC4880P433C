@@ -1,0 +1,27 @@
+## Camera App Component Manifest
+## ESP32-P4 Camera Application for ESP-Brookesia Phone System
+
+version: 1.0.0
+
+description: "Live camera preview and photo capture app for ESP32-P4 with OV02C10 sensor"
+
+dependencies:
+  idf: ">=5.5.1"
+  
+  # Brookesia framework dependencies
+  brookesia_core:
+    version: "*"
+    override_path: "../../esp-brookesia/core/brookesia_core"
+  
+  # Camera hardware dependencies (inherited from main project)
+  # esp_cam_sensor, esp_sccb_intf, esp_video, esp_ipa are declared in main/idf_component.yml
+  
+  # UI dependencies
+  lvgl/lvgl: ">=9,<10"
+  espressif/esp_lvgl_port: "^2"
+  
+  # BSP dependency (inherited from main project)
+  # csvke/esp32_p4_jc4880p433c_bsp is declared in main/idf_component.yml
+
+targets:
+  - esp32p4

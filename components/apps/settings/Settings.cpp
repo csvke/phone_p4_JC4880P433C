@@ -11,6 +11,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "Settings.hpp"
+#include "esp_lib_utils.h"
 #include <cinttypes>
 
 static const char *TAG = "AppSettings";
@@ -230,4 +231,18 @@ void AppSettings::onMainMenuClickedEventCallback(lv_event_t *e)
     if (index < UI_MAX_INDEX && self->_screen_list[index]) {
         lv_scr_load(self->_screen_list[index]);
     }
+}
+
+// Debug: Check if this code is being executed
+static bool __attribute__((used)) settings_registration_debug = []() {
+    ESP_LOGI("AppSettings", "Settings app registration code is being executed");
+    return true;
+}();
+
+// Register the settings app in the ESP-Brookesia registry  
+ESP_UTILS_REGISTER_PLUGIN(esp_brookesia::systems::base::App, AppSettings, "Settings");
+
+// Force linking function
+extern "C" void force_settings_app_link() {
+    // This function ensures the registrar static variable is not optimized away
 }

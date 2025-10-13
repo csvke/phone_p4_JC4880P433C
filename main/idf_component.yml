@@ -110,6 +110,19 @@ dependencies:
   #
   # Integration: Copy app to components/apps/ and register in main.cpp
   
+  # Custom Brookesia Phone Apps (using local components)
+  calculator:
+    version: "*"
+    override_path: "../components/apps/calculator"
+    
+  settings:
+    version: "*"
+    override_path: "../components/apps/settings"
+    
+  camera:
+    version: "*"
+    override_path: "../components/apps/camera"
+  
   # ========================================
   # CUSTOM APP DEPENDENCIES
   # ========================================
