@@ -6,10 +6,12 @@ This tool generates LVGL9-compatible icon files from Material Design Icons for u
 
 - 📥 Downloads icons directly from Material Design Icons (pictogrammers.com)
 - 🎨 Converts SVG to ARGB8888 format with alpha channel support
-- 🌟 Transparent backgrounds matching official Brookesia style
+- � Full color control: Customize both icon graphics and background colors
+- 🌟 Beautiful defaults: White icon on grey rounded background
 - 📝 Generates both `.c` and `.h` files ready to use
 - ⚡ Optimized for ESP32-P4 and Brookesia framework (112x112px default)
-- 🔧 Customizable icon size, background color, and rounded corners
+- 📁 Auto-organized output: Icons generated in `generated_icons/<icon_name>/`
+- 🔧 Highly customizable: size, icon color, background color, corner radius
 
 ## Installation
 
@@ -43,36 +45,49 @@ The interactive mode will guide you through:
 
 ### Basic Command-Line Usage
 
-Generate an icon from a Material Design Icons URL:
+Generate an icon with default styling (white icon, grey background, 12px rounded corners):
 
 ```bash
 python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/
 ```
 
-This will create:
-- `camera_icon.c` - Icon data in ARGB8888 format (transparent background, 112x112px)
+This will create in `generated_icons/camera_icon/`:
+- `camera_icon.c` - Icon data in ARGB8888 format (112x112px, white on grey, rounded)
 - `camera_icon.h` - Header file with declarations
+
+**Default Appearance:**
+- Icon graphics color: White (#FFFFFF)
+- Background color: Grey (#808080)
+- Corner radius: 12px (rounded corners)
+- Size: 112x112 pixels
 
 ### Advanced Command-Line Usage
 
 Specify custom styling and output options:
 
 ```bash
-# Standard transparent icon (Brookesia style)
-python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ \
-    --size 112 \
-    --save-metadata
+# Default styling (white icon, grey background, rounded)
+python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/
 
-# Icon with blue background and rounded corners
+# Black icon on blue background
 python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ \
-    --size 112 \
-    --bg-color "#2196F3" \
-    --radius 12 \
-    --save-metadata
+    --icon-color "#000000" \
+    --bg-color "#2196F3"
+
+# Transparent background, no rounded corners
+python generate_icon.py https://pictogrammers.com/library/mdi/icon/phone/ \
+    --bg-color none \
+    --radius 0
+
+# Red icon on green background with extra rounding
+python generate_icon.py https://pictogrammers.com/library/mdi/icon/heart/ \
+    --icon-color "#F44336" \
+    --bg-color "#4CAF50" \
+    --radius 20
 
 # Custom output path for specific app
 python generate_icon.py https://pictogrammers.com/library/mdi/icon/phone/ \
-    --size 112 \
+    --icon-color "#FFFFFF" \
     --bg-color "#4CAF50" \
     --radius 16 \
     --output ../../components/apps/phone/resources/phone_icon.c \
@@ -82,6 +97,8 @@ python generate_icon.py https://pictogrammers.com/library/mdi/icon/phone/ \
 # Smaller icon for UI elements
 python generate_icon.py https://pictogrammers.com/library/mdi/icon/message/ \
     --size 64 \
+    --icon-color "#FFFFFF" \
+    --bg-color "#9C27B0" \
     --name messaging_icon
 ```
 
@@ -92,24 +109,35 @@ python generate_icon.py https://pictogrammers.com/library/mdi/icon/message/ \
 | `url` | Material Design Icons URL | Required (optional in interactive mode) |
 | `-i, --interactive` | Run in interactive mode | False |
 | `--size` | Icon size in pixels (WxH) | 112 (Brookesia standard) |
-| `--bg-color` | Background color in hex format | None (transparent) |
-| `--radius` | Corner radius in pixels | 0 (square) |
-| `--output` | Output C file path | `<icon_name>.c` |
+| `--icon-color` | Icon graphics color in hex format (e.g., "#FFFFFF") | `#FFFFFF` (white) |
+| `--bg-color` | Background color in hex format or "none" for transparent | `#808080` (grey) |
+| `--radius` | Corner radius in pixels | 12 (rounded corners) |
+| `--output` | Output C file path | `generated_icons/<icon_name>/<icon_name>.c` |
 | `--name` | Override icon variable name | Extracted from URL |
 | `--save-metadata` | Save source metadata file | False |
 
-**Note:** Default icons have transparent backgrounds matching official Brookesia apps. Use `--bg-color` only if you need a colored background.
+**Note:** Default icons have white graphics on grey background with rounded corners for a modern look. Use `--icon-color` and `--bg-color` to customize, or set `--bg-color none` for transparent backgrounds.
 
-### Background Color Examples
+### Color Examples
 
+#### Icon Colors
 | Color | Hex Code | Use Case |
 |-------|----------|----------|
+| ⚪ White | `#FFFFFF` | Light icons on dark backgrounds (default) |
+| ⚫ Black | `#000000` | Dark icons on light backgrounds |
+| 🔵 Blue | `#2196F3` | Themed icons |
+| 🔴 Red | `#F44336` | Alert/warning icons |
+
+#### Background Colors
+| Color | Hex Code | Use Case |
+|-------|----------|----------|
+| ⚫ Grey | `#808080` | Neutral, professional (default) |
 | 🔵 Blue | `#2196F3` | Primary actions, phone dialer |
 | 🟢 Green | `#4CAF50` | Success, contacts, messaging |
 | 🔴 Red | `#F44336` | Alerts, delete actions |
 | 🟠 Orange | `#FF9800` | Warnings, media |
 | 🟣 Purple | `#9C27B0` | Creative apps, gallery |
-| ⚫ Grey | `#607D8B` | Settings, utilities |
+| Transparent | `none` | No background, icon only |
 
 ## Example: Camera App Icon with Styled Background
 
@@ -124,28 +152,28 @@ Then follow the prompts:
 - URL: `https://pictogrammers.com/library/mdi/icon/camera/`
 - Name: `camera_app_icon`
 - Size: `112` (press Enter for default)
-- Background: Leave empty for transparent (or enter `#FF5722` for orange)
-- Radius: `0` (or `16` for rounded)
+- Icon Color: `#FFFFFF` (press Enter for default white)
+- Background: `#FF5722` (or press Enter for default grey, or `none` for transparent)
+- Radius: `12` (press Enter for default, or `0` for square)
 - Location: Choose "2" for app's resources folder, then select "camera"
 - Metadata: `Y`
 
-### Option 2: Command-Line (Transparent Background)
+### Option 2: Command-Line (Default Styling)
 
 ```bash
 cd /path/to/phone_p4_JC4880P433C/tools/generate_icons
 python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ \
-    --size 112 \
     --output ../../components/apps/camera/resources/camera_icon.c \
     --name camera_app_icon \
     --save-metadata
 ```
 
-### Option 3: Command-Line (Colored Background)
+### Option 3: Command-Line (Custom Colors)
 
 ```bash
 cd /path/to/phone_p4_JC4880P433C/tools/generate_icons
 python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ \
-    --size 112 \
+    --icon-color "#FFFFFF" \
     --bg-color "#FF5722" \
     --radius 16 \
     --output ../../components/apps/camera/resources/camera_icon.c \
@@ -153,8 +181,21 @@ python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ \
     --save-metadata
 ```
 
+### Option 4: Transparent Background
+
+```bash
+cd /path/to/phone_p4_JC4880P433C/tools/generate_icons
+python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ \
+    --icon-color "#FFFFFF" \
+    --bg-color none \
+    --radius 0 \
+    --output ../../components/apps/camera/resources/camera_icon.c \
+    --name camera_app_icon \
+    --save-metadata
+```
+
 This creates:
-- `camera_icon.c` - Icon data in ARGB8888 format with transparent or colored background
+- `camera_icon.c` - Icon data in ARGB8888 format
 - `camera_icon.h` - Header file
 - `camera_icon_source.md` - Metadata with source URL and regeneration command
 
