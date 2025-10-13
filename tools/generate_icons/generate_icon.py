@@ -3,8 +3,13 @@
 Icon Generator for LVGL9 and ESP-Brookesia
 
 This script downloads Material Design Icons (MDI) from pictogrammers.com
-and converts them to LVGL9-compatible C code with ARGB8888 format (transparent background).
+and converts them to LVGL9-compatible C code with ARGB8888 format.
 Optimized for ESP-Brookesia phone apps with 112x112 pixel default size.
+
+Default appearance:
+- Icon graphics: White (#FFFFFF)
+- Background: Grey (#808080)
+- Corner radius: 12px (rounded)
 
 Usage:
     Interactive mode (recommended):
@@ -16,7 +21,8 @@ Usage:
 Example:
     python generate_icon.py --interactive
     python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/
-    python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ --size 112 --bg-color "#2196F3" --radius 12
+    python generate_icon.py https://pictogrammers.com/library/mdi/icon/camera/ --icon-color "#FFFFFF" --bg-color "#2196F3" --radius 12
+    python generate_icon.py https://pictogrammers.com/library/mdi/icon/phone/ --bg-color none --radius 0
 """
 
 import argparse
@@ -66,15 +72,60 @@ def hex_to_rgb(hex_color):
     hex_color = hex_color.lstrip('#')
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
-def svg_to_png(svg_data, size=112, bg_color=None, radius=0):
+def colorize_icon(image, icon_color):
     """
-    Convert SVG to PNG using cairosvg with optional background and rounded corners
+    Colorize the icon graphics while preserving transparency
+    
+    Args:
+        image: PIL Image in RGBA mode
+        icon_color: Target color as hex string (e.g., "#FFFFFF" for white)
+    
+    Returns:
+        Colorized image with preserved alpha channel
+    """
+    # Convert to RGBA if not already
+    if image.mode != 'RGBA':
+        image = image.convert('RGBA')
+    
+    # Get the target color
+    target_rgb = hex_to_rgb(icon_color)
+    
+    # Split into RGB and Alpha channels
+    r, g, b, a = image.split()
+    
+    # Create new colored layers based on alpha intensity
+    # The icon is typically white/light in SVG, we'll use the alpha as intensity
+    r_new = Image.new('L', image.size)
+    g_new = Image.new('L', image.size)
+    b_new = Image.new('L', image.size)
+    
+    # For each pixel, set color based on alpha (icon visibility)
+    pixels_a = a.load()
+    pixels_r = r_new.load()
+    pixels_g = g_new.load()
+    pixels_b = b_new.load()
+    
+    for y in range(image.size[1]):
+        for x in range(image.size[0]):
+            alpha_val = pixels_a[x, y]
+            # Apply target color with alpha intensity
+            pixels_r[x, y] = target_rgb[0]
+            pixels_g[x, y] = target_rgb[1]
+            pixels_b[x, y] = target_rgb[2]
+    
+    # Merge back with original alpha
+    return Image.merge('RGBA', (r_new, g_new, b_new, a))
+
+def svg_to_png(svg_data, size=112, icon_color="#FFFFFF", bg_color="#808080", radius=12):
+    """
+    Convert SVG to PNG with icon colorization, background, and rounded corners
     
     Args:
         svg_data: SVG content as bytes
         size: Output size in pixels (default 112 to match Brookesia standard)
-        bg_color: Background color as hex string (e.g., "#2196F3") or None for transparent
-        radius: Corner radius in pixels (0 for square)
+        icon_color: Icon graphics color as hex string (default: "#FFFFFF" white)
+        bg_color: Background color as hex string (default: "#808080" grey) or None for transparent
+        radius: Corner radius in pixels (default: 12 for rounded corners)
     """
     try:
         # First convert SVG to PNG with transparent background
@@ -90,7 +141,11 @@ def svg_to_png(svg_data, size=112, bg_color=None, radius=0):
         if image.mode != 'RGBA':
             image = image.convert('RGBA')
         
-        # If no background color and no radius, return as-is (with transparency)
+        # Colorize the icon if color is specified
+        if icon_color:
+            image = colorize_icon(image, icon_color)
+        
+        # If no background color and no radius, return colorized icon
         if not bg_color and radius == 0:
             return image
         
@@ -136,7 +191,7 @@ def svg_to_png(svg_data, size=112, bg_color=None, radius=0):
         print(f"Error converting SVG to PNG: {e}")
         return None
 
-def save_source_metadata(output_file, icon_name, url, size, bg_color, radius):
+def save_source_metadata(output_file, icon_name, url, size, icon_color, bg_color, radius):
     """Save metadata about icon source and generation parameters"""
     metadata_file = output_file.replace('.c', '_source.md')
     
@@ -157,6 +212,7 @@ def save_source_metadata(output_file, icon_name, url, size, bg_color, radius):
 ## Specifications
 - **Size:** {size}x{size} pixels
 - **Format:** ARGB8888 (LVGL9 compatible with alpha channel)
+- **Icon Color:** {icon_color if icon_color else 'Original'}
 - **Background Color:** {bg_color if bg_color else 'Transparent'}
 - **Corner Radius:** {radius}px
 - **Data Size:** {size * size * 4} bytes
@@ -179,6 +235,7 @@ To regenerate this icon with the same settings:
 ```bash
 python generate_icon.py {url} \\
     --size {size} \\
+    {f'--icon-color "{icon_color}" \\' if icon_color else ''}\\
     {f'--bg-color "{bg_color}" \\' if bg_color else ''}\\
     {f'--radius {radius} \\' if radius > 0 else ''}\\
     --output {output_file} \\
@@ -363,33 +420,47 @@ def interactive_mode():
             return 1
     
     # Step 3: Icon size
-    size_input = input("Icon size in pixels [64]: ").strip()
-    size = int(size_input) if size_input else 64
+    size_input = input("Icon size in pixels [112]: ").strip()
+    size = int(size_input) if size_input else 112
     
-    # Step 4: Background color
-    print("\nBackground color (leave empty for white):")
-    print("  Common colors: #2196F3 (blue), #4CAF50 (green), #F44336 (red)")
-    print("  #FF9800 (orange), #9C27B0 (purple), #607D8B (grey)")
-    bg_color_input = input("Background color (hex): ").strip()
-    bg_color = bg_color_input if bg_color_input else None
+    # Step 4: Icon graphics color
+    print("\nIcon graphics color (leave empty for white):")
+    print("  Common colors: #FFFFFF (white), #000000 (black), #2196F3 (blue)")
+    print("  #4CAF50 (green), #F44336 (red), #FF9800 (orange)")
+    icon_color_input = input("Icon color (hex) [#FFFFFF]: ").strip()
+    icon_color = icon_color_input if icon_color_input else "#FFFFFF"
     
-    # Step 5: Corner radius
-    radius_input = input("Corner radius in pixels (0 for square) [0]: ").strip()
-    radius = int(radius_input) if radius_input else 0
+    # Step 5: Background color
+    print("\nBackground color (leave empty for grey):")
+    print("  Common colors: #808080 (grey), #2196F3 (blue), #4CAF50 (green)")
+    print("  #F44336 (red), #FF9800 (orange), #9C27B0 (purple), #607D8B (blue-grey)")
+    print("  Or enter 'none' for transparent background")
+    bg_color_input = input("Background color (hex) [#808080]: ").strip()
+    if bg_color_input.lower() == 'none':
+        bg_color = None
+    else:
+        bg_color = bg_color_input if bg_color_input else "#808080"
     
-    # Step 6: Output location
+    # Step 6: Corner radius
+    radius_input = input("Corner radius in pixels [12]: ").strip()
+    radius = int(radius_input) if radius_input else 12
+    
+    # Step 7: Output location
     print("\n" + "="*60)
     print("Step 3: Output Location")
     print("-" * 60)
     print("Choose output location:")
-    print("  1. Current directory (./)")
+    print("  1. Generated icons directory (./generated_icons/<icon_name>/)")
     print("  2. Specific app's resources folder")
     print("  3. Custom path")
     
     location_choice = input("\nChoice [1]: ").strip() or "1"
     
     if location_choice == "1":
-        output_file = f"{icon_name}.c"
+        # Create generated_icons/<icon_name>/ directory
+        output_dir = Path("generated_icons") / icon_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = str(output_dir / f"{icon_name}.c")
     elif location_choice == "2":
         # Scan for available apps
         apps = scan_apps_directory()
@@ -424,7 +495,7 @@ def interactive_mode():
         custom_path = input("Enter custom output path: ").strip()
         output_file = custom_path if custom_path else f"{icon_name}.c"
     
-    # Step 7: Generate metadata file
+    # Step 8: Generate metadata file
     print("\n" + "="*60)
     print("Step 4: Metadata")
     print("-" * 60)
@@ -437,7 +508,8 @@ def interactive_mode():
     print(f"  Icon URL:        {url}")
     print(f"  Icon Name:       {icon_name}")
     print(f"  Size:            {size}x{size} px")
-    print(f"  Background:      {bg_color if bg_color else 'White'}")
+    print(f"  Icon Color:      {icon_color}")
+    print(f"  Background:      {bg_color if bg_color else 'Transparent'}")
     print(f"  Corner Radius:   {radius}px")
     print(f"  Output:          {output_file}")
     print(f"  Save Metadata:   {'Yes' if save_metadata == 'y' else 'No'}")
@@ -450,9 +522,9 @@ def interactive_mode():
     
     # Generate icon
     print("\nGenerating icon...")
-    return generate_icon(url, icon_name, size, bg_color, radius, output_file, save_metadata == 'y')
+    return generate_icon(url, icon_name, size, icon_color, bg_color, radius, output_file, save_metadata == 'y')
 
-def generate_icon(url, icon_name, size, bg_color, radius, output_file, save_metadata):
+def generate_icon(url, icon_name, size, icon_color, bg_color, radius, output_file, save_metadata):
     """Generate icon with given parameters"""
     
     # Download SVG
@@ -468,12 +540,12 @@ def generate_icon(url, icon_name, size, bg_color, radius, output_file, save_meta
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Convert SVG to PNG with background and radius
+    # Convert SVG to PNG with icon color, background and radius
     print(f"Converting to {size}x{size} PNG...")
-    if bg_color or radius > 0:
-        print(f"  Background: {bg_color if bg_color else 'white'}")
-        print(f"  Radius: {radius}px")
-    image = svg_to_png(svg_data, size, bg_color, radius)
+    print(f"  Icon color: {icon_color}")
+    print(f"  Background: {bg_color if bg_color else 'transparent'}")
+    print(f"  Radius: {radius}px")
+    image = svg_to_png(svg_data, size, icon_color, bg_color, radius)
     if not image:
         print("Failed to convert SVG to PNG")
         return 1
@@ -484,7 +556,7 @@ def generate_icon(url, icon_name, size, bg_color, radius, output_file, save_meta
     
     # Save metadata if requested
     if save_metadata:
-        save_source_metadata(output_file, final_icon_name, url, size, bg_color, radius)
+        save_source_metadata(output_file, final_icon_name, url, size, icon_color, bg_color, radius)
     
     print("\n✅ Icon generation complete!")
     print(f"\nGenerated files:")
@@ -508,19 +580,27 @@ Examples:
   Interactive mode (recommended):
     %(prog)s --interactive
   
-  Command-line mode:
+  Command-line mode with defaults (white icon, grey background, 12px radius):
     %(prog)s https://pictogrammers.com/library/mdi/icon/camera/
-    %(prog)s https://pictogrammers.com/library/mdi/icon/camera/ --size 112 --bg-color "#2196F3" --radius 12
-    %(prog)s https://pictogrammers.com/library/mdi/icon/phone/ --size 128 --name phone_app_icon --save-metadata
+  
+  Custom colors and size:
+    %(prog)s https://pictogrammers.com/library/mdi/icon/phone/ --icon-color "#000000" --bg-color "#2196F3" --size 128
+  
+  Transparent background, no radius:
+    %(prog)s https://pictogrammers.com/library/mdi/icon/settings/ --bg-color none --radius 0
+  
+  Full customization:
+    %(prog)s https://pictogrammers.com/library/mdi/icon/home/ --icon-color "#FFFFFF" --bg-color "#4CAF50" --radius 16 --save-metadata
         """
     )
     
     parser.add_argument('url', nargs='?', help='Material Design Icons URL (e.g., https://pictogrammers.com/library/mdi/icon/camera/)')
     parser.add_argument('-i', '--interactive', action='store_true', help='Run in interactive mode')
     parser.add_argument('--size', type=int, default=112, help='Icon size in pixels (default: 112 matching Brookesia standard)')
-    parser.add_argument('--bg-color', type=str, help='Background color in hex format (e.g., "#2196F3")')
-    parser.add_argument('--radius', type=int, default=0, help='Corner radius in pixels (default: 0 for square)')
-    parser.add_argument('--output', type=str, help='Output C file path (default: <icon_name>.c)')
+    parser.add_argument('--icon-color', type=str, default='#FFFFFF', help='Icon graphics color in hex format (default: "#FFFFFF" white)')
+    parser.add_argument('--bg-color', type=str, default='#808080', help='Background color in hex format (default: "#808080" grey, use "none" for transparent)')
+    parser.add_argument('--radius', type=int, default=12, help='Corner radius in pixels (default: 12 for rounded corners)')
+    parser.add_argument('--output', type=str, help='Output C file path (default: generated_icons/<icon_name>/<icon_name>.c)')
     parser.add_argument('--name', type=str, help='Override icon variable name (default: extracted from URL)')
     parser.add_argument('--save-metadata', action='store_true', help='Save source metadata file')
     
@@ -534,26 +614,31 @@ Examples:
     icon_name = args.name
     output_file = args.output if args.output else None
     
-    # If no output file specified, use icon name from URL
-    if not output_file:
-        extracted_name = extract_icon_name(args.url)
-        if extracted_name:
-            icon_name = icon_name if icon_name else f"{extracted_name}_icon"
-            output_file = f"{icon_name}.c"
-        else:
-            print("Error: Could not extract icon name from URL. Please specify --output or --name")
-            return 1
+    # Extract icon name from URL
+    extracted_name = extract_icon_name(args.url)
+    if not extracted_name:
+        print("Error: Could not extract icon name from URL. Please specify --output or --name")
+        return 1
     
-    # If no icon_name provided, extract from URL
+    # Set icon name
     if not icon_name:
-        extracted_name = extract_icon_name(args.url)
-        icon_name = f"{extracted_name}_icon" if extracted_name else None
+        icon_name = f"{extracted_name}_icon"
+    
+    # If no output file specified, use generated_icons/<icon_name>/<icon_name>.c
+    if not output_file:
+        output_dir = Path("generated_icons") / icon_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = str(output_dir / f"{icon_name}.c")
+    
+    # Handle "none" for transparent background
+    bg_color = None if args.bg_color.lower() == 'none' else args.bg_color
     
     return generate_icon(
         args.url,
         icon_name,
         args.size,
-        args.bg_color,
+        args.icon_color,
+        bg_color,
         args.radius,
         output_file,
         args.save_metadata
