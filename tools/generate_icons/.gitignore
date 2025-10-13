@@ -1,0 +1,3 @@
+# Ignore generated icons directory
+# Developers generate their own icons locally
+generated_icons/

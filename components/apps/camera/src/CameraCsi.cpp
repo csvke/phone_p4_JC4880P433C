@@ -6,6 +6,7 @@ extern "C" {
 #include "freertos/task.h"
 #include "camera_preview.h"
 #include "ui.h"
+#include "camera_app_icon.h"
 }
 
 static const char *TAG = "CameraCsi";
@@ -18,7 +19,7 @@ CameraCsi::CameraCsi()
         // Core app configuration
         {
             .name = "Camera",
-            .launcher_icon = esp_brookesia::gui::StyleImage::IMAGE(&img_app_camera),
+            .launcher_icon = esp_brookesia::gui::StyleImage::IMAGE(&camera_app_icon),
             .screen_size = esp_brookesia::gui::StyleSize::RECT_PERCENT(100, 100),
             .flags = {
                 .enable_default_screen = 1,
