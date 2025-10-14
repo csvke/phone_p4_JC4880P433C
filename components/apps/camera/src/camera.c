@@ -21,6 +21,7 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -51,11 +52,11 @@
 static const char *TAG = "camera";
 
 // Camera configuration (from sdkconfig.defaults)
-// OV02C10: 1920x1080 @ 30fps, 2-lane MIPI CSI, 400Mbps/lane
-#define CAMERA_HRES 1920
-#define CAMERA_VRES 1080
+// OV02C10: 1288x728 @ 30fps, 1-lane MIPI CSI, 400Mbps/lane (manufacturer config)
+#define CAMERA_HRES 1288
+#define CAMERA_VRES 728
 #define CAMERA_LANE_BITRATE_MBPS 400
-#define CAMERA_DATA_LANES 2
+#define CAMERA_DATA_LANES 1
 
 // Frame buffer configuration
 #define CAMERA_FRAME_BUFFER_COUNT 1  // Single frame buffer for LVGL integration
@@ -75,10 +76,10 @@ static isp_proc_handle_t isp_proc = NULL;
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static esp_cam_sensor_device_t *cam_sensor = NULL;
 
-// LVGL objects
-static lv_obj_t *preview_image = NULL;
+// LVGL display objects
 static lv_obj_t *preview_parent = NULL;
-static lv_img_dsc_t img_dsc = {0};
+static lv_obj_t *preview_canvas = NULL;
+static lv_display_t *display = NULL;
 
 // Frame buffer (used by both Camera Controller and LVGL)
 static void *frame_buffer = NULL;
@@ -89,6 +90,10 @@ static esp_cam_ctlr_trans_t frame_trans = {0};
 
 // Task handle for frame reception
 static TaskHandle_t preview_task_handle = NULL;
+
+// Timing measurement variables (use TickType_t for ISR-safe timing)
+static TickType_t last_callback_time = 0;
+static int64_t last_frame_time_us = 0;
 
 /**
  * Camera callback: Provide new buffer for next frame
@@ -101,7 +106,9 @@ static bool camera_get_new_vb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t
     trans->buflen = new_trans.buflen;
 
     return false;
-}/**
+}
+
+/**
  * Camera callback: Frame reception finished
  */
 static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data)
@@ -111,8 +118,11 @@ static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_tra
     static uint32_t callback_count = 0;
     callback_count++;
     
+    // Use system tick count (safe in ISR) - will measure in task
+    last_callback_time = xTaskGetTickCountFromISR();
+    
     // Log first few callbacks for debugging
-    if (callback_count <= 5) {
+    if (callback_count <= 10) {
         ESP_EARLY_LOGI(TAG, "Frame callback #%lu triggered", callback_count);
     }
     
@@ -201,59 +211,42 @@ static esp_err_t init_isp_processor(void)
 }
 
 /**
- * Initialize LVGL image for preview display (lightweight approach)
+ * Initialize LVGL canvas for camera preview
  */
 static esp_err_t init_preview_display(void)
 {
-    ESP_LOGI(TAG, "Initializing preview display...");
+    ESP_LOGI(TAG, "Initializing LVGL canvas preview...");
     
-    lv_display_t *display = lv_display_get_default();
+    if (!preview_parent) {
+        ESP_LOGE(TAG, "No preview parent set");
+        return ESP_FAIL;
+    }
+    
+    display = lv_display_get_default();
     if (!display) {
         ESP_LOGE(TAG, "No LVGL display found");
         return ESP_FAIL;
     }
     
-    // Create image object (more efficient than canvas for camera feed)
-    lv_obj_t *parent = preview_parent ? preview_parent : lv_screen_active();
-    preview_image = lv_img_create(parent);
-    if (!preview_image) {
-        ESP_LOGE(TAG, "Failed to create preview image");
+    int32_t display_width = lv_display_get_horizontal_resolution(display);
+    int32_t display_height = lv_display_get_vertical_resolution(display);
+    
+    ESP_LOGI(TAG, "Display: %dx%d, Camera: %dx%d", 
+             display_width, display_height, CAMERA_HRES, CAMERA_VRES);
+    
+    // Create LVGL canvas for camera preview
+    preview_canvas = lv_canvas_create(preview_parent);
+    if (!preview_canvas) {
+        ESP_LOGE(TAG, "Failed to create LVGL canvas");
         return ESP_FAIL;
     }
     
-    // Initialize image descriptor pointing to frame buffer (LVGL v9 format)
-    img_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-    img_dsc.header.flags = 0;
-    img_dsc.header.w = CAMERA_HRES;
-    img_dsc.header.h = CAMERA_VRES;
-    img_dsc.header.stride = CAMERA_HRES * 2;  // 2 bytes per pixel for RGB565
-    img_dsc.header.reserved_2 = 0;
-    img_dsc.data = frame_buffer;
-    img_dsc.data_size = frame_buffer_size;
+    // Center and fit the canvas on screen
+    lv_obj_set_size(preview_canvas, CAMERA_HRES, CAMERA_VRES);
+    lv_obj_center(preview_canvas);
     
-    // Set the image source
-    lv_img_set_src(preview_image, &img_dsc);
+    ESP_LOGI(TAG, "LVGL canvas created successfully");
     
-    // Scale image to fit display
-    if (preview_parent) {
-        lv_obj_set_size(preview_image, lv_pct(100), lv_pct(100));
-        lv_obj_center(preview_image);
-    } else {
-        int32_t display_width = lv_display_get_horizontal_resolution(display);
-        int32_t display_height = lv_display_get_vertical_resolution(display);
-        
-        float scale_x = (float)display_width / CAMERA_HRES;
-        float scale_y = (float)display_height / CAMERA_VRES;
-        float scale = (scale_x < scale_y) ? scale_x : scale_y;
-        
-        lv_obj_set_size(preview_image, 
-                       (int32_t)(CAMERA_HRES * scale), 
-                       (int32_t)(CAMERA_VRES * scale));
-        lv_obj_center(preview_image);
-    }
-    
-    ESP_LOGI(TAG, "Preview display initialized");
     return ESP_OK;
 }
 
@@ -267,51 +260,102 @@ static void preview_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Preview task started");
     
-    // Create LOCAL transaction structure for receive() calls (like reference example)
-    // This is separate from the global frame_trans used for callback registration
-    esp_cam_ctlr_trans_t trans = {
-        .buffer = frame_buffer,
-        .buflen = frame_buffer_size,
-    };
-    
     uint32_t frame_count = 0;
     TickType_t last_log_time = xTaskGetTickCount();
     
+    // Use global frame_trans which is set up by callbacks (ISP requires this!)
+    
     while (preview_running) {
-        // Blocking call - waits until frame is ready (like the example does)
-        if (frame_count <= 5) {
-            ESP_LOGI(TAG, "Calling esp_cam_ctlr_receive() for frame #%lu...", frame_count + 1);
+        // *** ISP-INTEGRATED PATTERN: Pure callback-driven (no manual receive() needed) ***
+        // The ISP callbacks handle buffer management automatically
+        // We just wait for frame_ready notification from callback
+        
+        // Wait for callback notification that frame is ready
+        if (xSemaphoreTake(frame_ready_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGW(TAG, "Frame timeout - no callback received in 1 second");
+            continue;
         }
         
-        esp_err_t ret = esp_cam_ctlr_receive(cam_handle, &trans, ESP_CAM_CTLR_MAX_DELAY);
-        
-        if (frame_count <= 5) {
-            ESP_LOGI(TAG, "esp_cam_ctlr_receive() returned: %s", esp_err_to_name(ret));
+        // Frame is ready in frame_trans.buffer (set by callbacks)
+        esp_err_t ret = ESP_OK;
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to receive frame: %s", esp_err_to_name(ret));
+            continue;
         }
         
-        if (ret == ESP_OK) {
-            frame_count++;
+        // Measure frame timing (NOW safe to use esp_timer_get_time in task context)
+        int64_t frame_time_us = esp_timer_get_time();
+        int64_t processing_start = frame_time_us;
+        
+        // Frame received successfully!
+        frame_count++;
             
-            // Log first few frames for debugging
-            if (frame_count <= 5) {
-                // Check first few pixels to see what data we're getting
-                uint16_t *pixels = (uint16_t *)trans.buffer;
+            // Calculate frame interval (time between consecutive frames)
+            int64_t frame_interval_us = 0;
+            if (last_frame_time_us != 0) {
+                frame_interval_us = frame_time_us - last_frame_time_us;
+            }
+            last_frame_time_us = frame_time_us;
+            
+            // Log first few frames with timing
+            if (frame_count <= 10) {
+                uint16_t *pixels = (uint16_t *)frame_trans.buffer;
                 ESP_LOGI(TAG, "Frame #%lu received, first pixels: 0x%04x 0x%04x 0x%04x", 
                         frame_count, pixels[0], pixels[1], pixels[2]);
-            }
-            
-            // Sync cache before LVGL reads the frame buffer
-            esp_cache_msync(trans.buffer, trans.buflen, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-            
-            // Frame received - update LVGL image (lightweight approach)
-            if (preview_image && lvgl_port_lock(10)) {
-                // Invalidate object to trigger redraw
-                lv_obj_invalidate(preview_image);
-                lvgl_port_unlock();
                 
-                // Small yield to allow LVGL to process (no heavy rendering needed for direct image)
-                vTaskDelay(pdMS_TO_TICKS(1));
+                // Log frame interval for first 10 frames
+                if (frame_interval_us > 0) {
+                    float fps = 1000000.0f / frame_interval_us;
+                    ESP_LOGI(TAG, "Frame #%lu interval: %lld us (%.1f fps)", 
+                            frame_count, frame_interval_us, fps);
+                }
             }
+            
+            // Sync cache before accessing the frame buffer
+            int64_t cache_sync_start = esp_timer_get_time();
+            esp_cache_msync(frame_trans.buffer, frame_trans.buflen, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            int64_t cache_sync_end = esp_timer_get_time();
+            
+            // Sample pixels from different parts of the frame (first 10 frames only for debugging)
+            if (frame_count <= 10) {
+                uint16_t *pixels = (uint16_t *)frame_trans.buffer;
+                int mid_idx = (CAMERA_VRES / 2) * CAMERA_HRES + (CAMERA_HRES / 2);
+                int corner_idx = (CAMERA_VRES - 1) * CAMERA_HRES + (CAMERA_HRES - 1);
+                ESP_LOGI(TAG, "Frame #%lu - Start: 0x%04x Mid: 0x%04x End: 0x%04x", 
+                        frame_count, pixels[0], pixels[mid_idx], pixels[corner_idx]);
+            }
+            
+            // Update LVGL canvas with new frame
+            if (preview_canvas) {
+                // Acquire LVGL lock for thread-safe access (critical!)
+                // This prevents race conditions with LVGL's render task
+                lv_lock();
+                
+                // Update canvas buffer to point to the new frame
+                lv_canvas_set_buffer(preview_canvas, frame_trans.buffer, 
+                                   CAMERA_HRES, CAMERA_VRES, 
+                                   LV_COLOR_FORMAT_RGB565);
+                
+                // Invalidate to trigger LVGL refresh (non-blocking)
+                lv_obj_invalidate(preview_canvas);
+                
+                // Release LVGL lock immediately
+                lv_unlock();
+            }
+            
+            int64_t processing_end = esp_timer_get_time();
+            
+            // Log detailed timing for first 10 frames
+            if (frame_count <= 10) {
+                int64_t cache_sync_time_us = cache_sync_end - cache_sync_start;
+                int64_t total_processing_us = processing_end - processing_start;
+                
+                ESP_LOGI(TAG, "Frame #%lu timing - Cache sync: %lld us, Canvas update: %lld us", 
+                        frame_count, cache_sync_time_us, total_processing_us);
+            }
+            
+            // Yield to prevent watchdog timeout (allows idle task to run)
+            vTaskDelay(pdMS_TO_TICKS(1));
             
             // Log frame rate every second
             TickType_t now = xTaskGetTickCount();
@@ -320,10 +364,6 @@ static void preview_task(void *pvParameters)
                 frame_count = 0;
                 last_log_time = now;
             }
-        } else {
-            ESP_LOGE(TAG, "Failed to receive frame: %s", esp_err_to_name(ret));
-            vTaskDelay(pdMS_TO_TICKS(100));  // Small delay on error
-        }
     }
     
     ESP_LOGI(TAG, "Preview task ended");
@@ -492,13 +532,15 @@ esp_err_t camera_start(void)
     // Initialize LVGL display
     ESP_RETURN_ON_ERROR(init_preview_display(), TAG, "Preview display init failed");
     
-    // Start camera controller
+    // Start camera controller streaming (MUST be before starting task)
     ESP_RETURN_ON_ERROR(
         esp_cam_ctlr_start(cam_handle),
         TAG, "Failed to start camera controller"
     );
     
-    // Start preview task
+    ESP_LOGI(TAG, "Camera controller started, creating preview task");
+    
+    // Start preview task - it will handle receive() in blocking loop (ESP-IDF example pattern)
     preview_running = true;
     BaseType_t task_ret = xTaskCreate(
         preview_task,
@@ -598,16 +640,9 @@ void camera_deinit(void)
         cam_handle = NULL;
     }
     
-    // Clean up LVGL objects
-    lv_obj_t *image_temp = preview_image;
-    preview_image = NULL;
-    img_dsc.data = NULL;
-    
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    if (image_temp) {
-        lv_obj_delete(image_temp);
-    }
+    // Clean up display reference
+    display = NULL;
+    preview_canvas = NULL;
     
     // Free frame buffer
     if (frame_buffer) {
