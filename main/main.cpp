@@ -11,7 +11,7 @@
 // Include apps to force linking (for registry-based installation)
 #include "Calculator.hpp"
 #include "Settings.hpp"
-#include "CameraCsi.hpp"
+#include "CameraApp.hpp"
 
 using namespace esp_brookesia;
 using namespace esp_brookesia::gui;
@@ -123,12 +123,12 @@ extern "C" void app_main(void)
         });
         
         // Force linking of our app components by referencing them
-        extern void force_camera_app_link();
         extern void force_calculator_app_link();
         extern void force_settings_app_link();
-        force_camera_app_link();
+        extern void force_camera_app_link();
         force_calculator_app_link();
         force_settings_app_link();
+        force_camera_app_link();
         
         ESP_UTILS_LOGI("After forced linking - Plugin count: %zu", systems::base::App::Registry::getPluginCount());
         systems::base::App::Registry::forEach([](const auto &plugin) {
