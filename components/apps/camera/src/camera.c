@@ -52,7 +52,9 @@
 static const char *TAG = "camera";
 
 // Camera configuration (from sdkconfig.defaults)
-// OV02C10: 1288x728 @ 30fps, 1-lane MIPI CSI, 400Mbps/lane (manufacturer config)
+// PRODUCTION: OV02C10 1-lane 1288x728 - stable 30.1 FPS (validated)
+// Frame buffer size: 1288x728x2 = 1,875,968 bytes (~1.8MB)
+// Optimization testing completed: 1920x1080 maxes at 11.1 FPS (blanking limited)
 #define CAMERA_HRES 1288
 #define CAMERA_VRES 728
 #define CAMERA_LANE_BITRATE_MBPS 400
@@ -398,7 +400,9 @@ esp_err_t camera_start(void)
         frame_buffer_size = (raw_size + 127) & ~127;  // Align to 128 bytes
         ESP_LOGI(TAG, "Allocating frame buffer: %zu bytes (raw: %zu)", frame_buffer_size, raw_size);
         
-        // Allocate with 128-byte alignment for cache line alignment
+        // Allocate in PSRAM (tested and validated at 30.1 FPS)
+        // Note: Internal DMA RAM (~221KB) is insufficient for frame buffers (need 1.8MB+)
+        // PSRAM @ 200MHz provides excellent performance (cache sync ~8µs)
         frame_buffer = heap_caps_aligned_calloc(128, 1, frame_buffer_size, 
                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!frame_buffer) {
@@ -406,10 +410,12 @@ esp_err_t camera_start(void)
             return ESP_ERR_NO_MEM;
         }
         
+        ESP_LOGI(TAG, "Frame buffer allocated in PSRAM");
+        
         // Initialize to white (like the example) - will be overwritten by camera data
         memset(frame_buffer, 0xFF, frame_buffer_size);
         
-        // Sync cache for SPIRAM buffer (required for ESP32-P4)
+        // Sync cache (required for ESP32-P4)
         esp_cache_msync((void *)frame_buffer, frame_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
         
         frame_trans.buffer = frame_buffer;
@@ -460,7 +466,7 @@ esp_err_t camera_start(void)
         
         ESP_LOGI(TAG, "OV02C10 sensor detected successfully");
         
-        // Configure sensor for 1920x1080 @ 30fps
+        // Configure sensor for target resolution
         esp_cam_sensor_format_array_t formats;
         cam_sensor->ops->query_support_formats(cam_sensor, &formats);
         
@@ -475,29 +481,29 @@ esp_err_t camera_start(void)
                     formats.format_array[i].fps);
         }
         
-        // Find 1920x1080 2-lane format (prefer 2-lane over 1-lane for better bandwidth)
+        // Find matching format (resolution and lane count)
         const esp_cam_sensor_format_t *target_format = NULL;
+        const char *lane_keyword = (CAMERA_DATA_LANES == 2) ? "2lane" : "1lane";
+        
         for (uint32_t i = 0; i < formats.count; i++) {
             if (formats.format_array[i].width == CAMERA_HRES &&
                 formats.format_array[i].height == CAMERA_VRES) {
-                // Check if this is the 2-lane format (contains "2lane" in name)
-                if (strstr(formats.format_array[i].name, "2lane")) {
+                // Check if lane count matches
+                if (strstr(formats.format_array[i].name, lane_keyword)) {
                     target_format = &formats.format_array[i];
-                    ESP_LOGI(TAG, "Selected 2-lane format: %s (%dx%d @ %d fps)",
+                    ESP_LOGI(TAG, "Selected format: %s (%dx%d @ %d fps)",
                             target_format->name,
                             target_format->width, target_format->height, target_format->fps);
                     break;
                 } else if (!target_format) {
-                    // Fallback to first matching resolution if no 2-lane found
+                    // Fallback to first matching resolution if no lane-specific format found
                     target_format = &formats.format_array[i];
                 }
             }
         }
         
-        if (target_format && !strstr(target_format->name, "2lane")) {
-            ESP_LOGW(TAG, "Using 1-lane format as fallback: %s (%dx%d @ %d fps)",
-                    target_format->name,
-                    target_format->width, target_format->height, target_format->fps);
+        if (target_format && !strstr(target_format->name, lane_keyword)) {
+            ESP_LOGW(TAG, "Could not find %s format, using: %s", lane_keyword, target_format->name);
         }
         
         if (!target_format) {
