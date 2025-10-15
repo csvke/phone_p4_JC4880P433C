@@ -35,6 +35,7 @@
 #include "esp_cam_ctlr_csi.h"
 #include "esp_cam_ctlr.h"
 #include "driver/isp.h"
+#include "driver/isp_ccm.h"
 #include "driver/i2c_master.h"
 
 // Camera Sensor API
@@ -54,11 +55,16 @@ static const char *TAG = "camera";
 // Camera configuration (from sdkconfig.defaults)
 // PRODUCTION: OV02C10 1-lane 1288x728 - stable 30.1 FPS (validated)
 // Frame buffer size: 1288x728x2 = 1,875,968 bytes (~1.8MB)
-// Optimization testing completed: 1920x1080 maxes at 11.1 FPS (blanking limited)
 #define CAMERA_HRES 1288
 #define CAMERA_VRES 728
 #define CAMERA_LANE_BITRATE_MBPS 400
 #define CAMERA_DATA_LANES 1
+
+// // Testing: 1920x1080 maxes at 11.1 FPS (blanking limited)
+// #define CAMERA_HRES 1920
+// #define CAMERA_VRES 1080
+// #define CAMERA_LANE_BITRATE_MBPS 400
+// #define CAMERA_DATA_LANES 2
 
 // Frame buffer configuration
 #define CAMERA_FRAME_BUFFER_COUNT 1  // Single frame buffer for LVGL integration
@@ -208,7 +214,28 @@ static esp_err_t init_isp_processor(void)
         TAG, "Failed to enable ISP processor"
     );
     
-    ESP_LOGI(TAG, "ISP processor initialized");
+    // Configure Color Correction Matrix (CCM) to fix purple tint
+    // Identity matrix baseline with adjustments to reduce blue/purple cast
+    esp_isp_ccm_config_t ccm_config = {
+        .matrix = {
+            {1.0,  0.0,  0.0},   // Red channel: pass through
+            {0.0,  1.0,  0.0},   // Green channel: pass through
+            {0.0,  0.0,  0.85}   // Blue channel: reduce by 15% to counteract purple tint
+        },
+        .saturation = true
+    };
+    
+    ESP_RETURN_ON_ERROR(
+        esp_isp_ccm_configure(isp_proc, &ccm_config),
+        TAG, "Failed to configure CCM"
+    );
+    
+    ESP_RETURN_ON_ERROR(
+        esp_isp_ccm_enable(isp_proc),
+        TAG, "Failed to enable CCM"
+    );
+    
+    ESP_LOGI(TAG, "ISP processor initialized with CCM (purple tint correction)");
     return ESP_OK;
 }
 
