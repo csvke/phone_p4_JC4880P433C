@@ -36,6 +36,8 @@
 #include "esp_cam_ctlr.h"
 #include "driver/isp.h"
 #include "driver/isp_ccm.h"
+#include "driver/isp_awb.h"
+#include "driver/isp_color.h"
 #include "driver/i2c_master.h"
 
 // Camera Sensor API
@@ -81,6 +83,7 @@ static SemaphoreHandle_t frame_ready_sem = NULL;
 // Camera Controller and ISP handles
 static esp_cam_ctlr_handle_t cam_handle = NULL;
 static isp_proc_handle_t isp_proc = NULL;
+static isp_awb_ctlr_t awb_ctrl = NULL;
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static esp_cam_sensor_device_t *cam_sensor = NULL;
 
@@ -220,7 +223,7 @@ static esp_err_t init_isp_processor(void)
         .matrix = {
             {1.0,  0.0,  0.0},   // Red channel: pass through
             {0.0,  1.0,  0.0},   // Green channel: pass through
-            {0.0,  0.0,  0.85}   // Blue channel: reduce by 15% to counteract purple tint
+            {0.0,  0.0,  0.75}   // Blue channel: reduce by 15% to counteract purple tint
         },
         .saturation = true
     };
@@ -235,7 +238,72 @@ static esp_err_t init_isp_processor(void)
         TAG, "Failed to enable CCM"
     );
     
-    ESP_LOGI(TAG, "ISP processor initialized with CCM (purple tint correction)");
+    // Configure Automatic White Balance (AWB)
+    // Sample after CCM since we're applying CCM corrections
+    esp_isp_awb_config_t awb_config = {
+        .sample_point = ISP_AWB_SAMPLE_POINT_AFTER_CCM,  // Sample after CCM correction
+        .window = {
+            .top_left = {
+                .x = CAMERA_HRES / 6,      // Start 1/6 from left
+                .y = CAMERA_VRES / 6       // Start 1/6 from top
+            },
+            .btm_right = {
+                .x = CAMERA_HRES * 5 / 6,  // End 5/6 from left (middle 2/3)
+                .y = CAMERA_VRES * 5 / 6   // End 5/6 from top (middle 2/3)
+            }
+        },
+        .white_patch = {
+            .luminance = {
+                .min = 0,       // Allow low light operation
+                .max = 220 * 3  // Exclude overexposed pixels (not 255*3)
+            },
+            .red_green_ratio = {
+                .min = 0.0,
+                .max = 3.999    // Wide range to catch all color casts
+            },
+            .blue_green_ratio = {
+                .min = 0.0,
+                .max = 3.999    // Wide range to catch all color casts
+            }
+        },
+        .intr_priority = 0  // Let driver choose priority
+    };
+    
+    ESP_RETURN_ON_ERROR(
+        esp_isp_new_awb_controller(isp_proc, &awb_config, &awb_ctrl),
+        TAG, "Failed to create AWB controller"
+    );
+    
+    ESP_RETURN_ON_ERROR(
+        esp_isp_awb_controller_enable(awb_ctrl),
+        TAG, "Failed to enable AWB controller"
+    );
+    
+    // Configure Color Adjustments (brightness, saturation, contrast, hue)
+    esp_isp_color_config_t color_config = {
+        .color_contrast = {
+            .integer = 1,
+            .decimal = 0        // Contrast: 1.0 (normal, range 0-1.0)
+        },
+        .color_saturation = {
+            .integer = 1,
+            .decimal = 0        // Saturation: 1.0 (normal, range 0-1.0)
+        },
+        .color_hue = 0,         // Hue: 0 degrees (no shift, range 0-360)
+        .color_brightness = 0   // Brightness: 0 (normal, range -128 to +127)
+    };
+    
+    ESP_RETURN_ON_ERROR(
+        esp_isp_color_configure(isp_proc, &color_config),
+        TAG, "Failed to configure color adjustments"
+    );
+    
+    ESP_RETURN_ON_ERROR(
+        esp_isp_color_enable(isp_proc),
+        TAG, "Failed to enable color adjustments"
+    );
+    
+    ESP_LOGI(TAG, "ISP processor initialized with CCM, AWB, and color adjustments");
     return ESP_OK;
 }
 
@@ -658,6 +726,13 @@ void camera_deinit(void)
     ESP_LOGI(TAG, "Cleaning up camera resources...");
     
     camera_stop();
+    
+    // Disable and delete AWB controller
+    if (awb_ctrl) {
+        esp_isp_awb_controller_disable(awb_ctrl);
+        esp_isp_del_awb_controller(awb_ctrl);
+        awb_ctrl = NULL;
+    }
     
     // Disable and delete ISP processor
     if (isp_proc) {
