@@ -22,6 +22,7 @@
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -357,6 +358,9 @@ static void preview_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Preview task started");
     
+    // Subscribe to watchdog to prevent triggering (camera task keeps CPU1 busy)
+    esp_task_wdt_add(NULL);  // Add current task to watchdog
+    
     uint32_t frame_count = 0;
     TickType_t last_log_time = xTaskGetTickCount();
     
@@ -454,6 +458,9 @@ static void preview_task(void *pvParameters)
             // Yield to prevent watchdog timeout (allows idle task to run)
             vTaskDelay(pdMS_TO_TICKS(1));
             
+            // Reset watchdog for this task
+            esp_task_wdt_reset();
+            
             // Log frame rate every second
             TickType_t now = xTaskGetTickCount();
             if ((now - last_log_time) >= pdMS_TO_TICKS(1000)) {
@@ -464,6 +471,10 @@ static void preview_task(void *pvParameters)
     }
     
     ESP_LOGI(TAG, "Preview task ended");
+    
+    // Unsubscribe from watchdog before exiting
+    esp_task_wdt_delete(NULL);
+    
     preview_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -473,6 +484,8 @@ static void preview_task(void *pvParameters)
  */
 esp_err_t camera_start(void)
 {
+    esp_err_t ret;
+    
     if (preview_running) {
         ESP_LOGW(TAG, "Camera already running");
         return ESP_OK;
@@ -537,7 +550,7 @@ esp_err_t camera_start(void)
             .device_address = OV02C10_SCCB_ADDR,
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         };
-        esp_err_t ret = sccb_new_i2c_io(i2c_bus, &i2c_config, &sccb_io_handle);
+        ret = sccb_new_i2c_io(i2c_bus, &i2c_config, &sccb_io_handle);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to create SCCB I2C handle: %s", esp_err_to_name(ret));
             return ret;
@@ -614,15 +627,27 @@ esp_err_t camera_start(void)
         }
         ESP_LOGI(TAG, "Sensor format set successfully");
         
-        // Start sensor streaming
-        int stream_on = 1;
-        ret = cam_sensor->ops->priv_ioctl(cam_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_on);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to start sensor streaming: %s", esp_err_to_name(ret));
-            return ret;
+        // CRITICAL: Stop sensor streaming if it's already running (first boot scenario)
+        // On first boot, sensor hardware may be in unknown state (powered on by bootloader
+        // or residual state from previous power cycle). Explicitly stop to ensure clean state.
+        int stream_off = 0;
+        ret = cam_sensor->ops->priv_ioctl(cam_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_off);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Sensor stream stopped (ensuring clean state on first init)");
+        } else {
+            ESP_LOGW(TAG, "Sensor stream stop returned: %s (may already be stopped)", esp_err_to_name(ret));
         }
-        ESP_LOGI(TAG, "Sensor stream started - OV02C10 configured and streaming");
     }
+    
+    // Start sensor streaming (MUST be outside the init block to support restart)
+    // This ensures the stream is started on every camera_start(), not just first init
+    int stream_on = 1;
+    ret = cam_sensor->ops->priv_ioctl(cam_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_on);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start sensor streaming: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "Sensor stream started");
     
     // Initialize camera controller
     ESP_RETURN_ON_ERROR(init_camera_controller(), TAG, "Camera controller init failed");
@@ -674,6 +699,17 @@ esp_err_t camera_stop(void)
     }
     
     ESP_LOGI(TAG, "Stopping camera...");
+    
+    // Stop sensor streaming FIRST (critical for clean restart)
+    if (cam_sensor) {
+        int stream_off = 0;
+        esp_err_t ret = cam_sensor->ops->priv_ioctl(cam_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_off);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Sensor stream stopped");
+        } else {
+            ESP_LOGW(TAG, "Failed to stop sensor stream: %s", esp_err_to_name(ret));
+        }
+    }
     
     // Stop camera controller
     if (cam_handle) {
@@ -763,6 +799,10 @@ void camera_deinit(void)
         vSemaphoreDelete(frame_ready_sem);
         frame_ready_sem = NULL;
     }
+    
+    // CRITICAL: Clear sensor pointer so it gets re-initialized on next launch
+    // Without this, second launch skips sensor init and tries to stream on cleaned-up sensor
+    cam_sensor = NULL;
     
     camera_initialized = false;
     preview_parent = NULL;
