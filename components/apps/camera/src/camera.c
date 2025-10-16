@@ -36,6 +36,7 @@
 #include "esp_cam_ctlr_csi.h"
 #include "esp_cam_ctlr.h"
 #include "driver/isp.h"
+#include "driver/isp_demosaic.h"
 #include "driver/isp_ccm.h"
 #include "driver/isp_awb.h"
 #include "driver/isp_color.h"
@@ -218,6 +219,30 @@ static esp_err_t init_isp_processor(void)
         TAG, "Failed to enable ISP processor"
     );
     
+    // Configure Demosaic module for RAW10 → RGB conversion (Bayer demosaicing)
+    esp_isp_demosaic_config_t demosaic_config = {
+        .grad_ratio = {
+            .integer = 2,  // Gradient ratio integer part (0-3 valid range)
+            .decimal = 0,
+        },
+        .padding_mode = ISP_DEMOSAIC_EDGE_PADDING_MODE_SRND_DATA,
+        .padding_data = 0x00,
+        .padding_line_tail_valid_start_pixel = 0,
+        .padding_line_tail_valid_end_pixel = 0,
+    };
+    
+    ESP_RETURN_ON_ERROR(
+        esp_isp_demosaic_configure(isp_proc, &demosaic_config),
+        TAG, "Failed to configure Demosaic"
+    );
+    
+    ESP_RETURN_ON_ERROR(
+        esp_isp_demosaic_enable(isp_proc),
+        TAG, "Failed to enable Demosaic (RAW to RGB conversion)"
+    );
+    
+    ESP_LOGI(TAG, "ISP Demosaic module enabled (RAW10 → RGB conversion)");
+    
     // Configure Color Correction Matrix (CCM) to fix purple tint
     // Identity matrix baseline with adjustments to reduce blue/purple cast
     esp_isp_ccm_config_t ccm_config = {
@@ -304,7 +329,7 @@ static esp_err_t init_isp_processor(void)
         TAG, "Failed to enable color adjustments"
     );
     
-    ESP_LOGI(TAG, "ISP processor initialized with CCM, AWB, and color adjustments");
+    ESP_LOGI(TAG, "ISP processor initialized with Demosaic, CCM, AWB, and color adjustments");
     return ESP_OK;
 }
 
@@ -770,8 +795,11 @@ void camera_deinit(void)
         awb_ctrl = NULL;
     }
     
-    // Disable and delete ISP processor
+    // Disable and delete ISP processor (includes Demosaic, CCM, color modules)
     if (isp_proc) {
+        esp_isp_demosaic_disable(isp_proc);
+        esp_isp_ccm_disable(isp_proc);
+        esp_isp_color_disable(isp_proc);
         esp_isp_disable(isp_proc);
         esp_isp_del_processor(isp_proc);
         isp_proc = NULL;
