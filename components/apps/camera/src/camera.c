@@ -41,6 +41,7 @@
 #include "driver/isp_awb.h"
 #include "driver/isp_color.h"
 #include "driver/i2c_master.h"
+#include "driver/ppa.h"  // Pixel Processing Accelerator for scaling
 
 // Camera Sensor API
 #include "esp_cam_sensor.h"
@@ -70,6 +71,11 @@ static const char *TAG = "camera";
 // #define CAMERA_LANE_BITRATE_MBPS 400
 // #define CAMERA_DATA_LANES 2
 
+// Display configuration (480x800 portrait)
+// PPA will scale camera output to fit display
+#define DISPLAY_WIDTH 480
+#define DISPLAY_HEIGHT 800
+
 // Frame buffer configuration
 #define CAMERA_FRAME_BUFFER_COUNT 1  // Single frame buffer for LVGL integration
 #define RGB565_BITS_PER_PIXEL 16
@@ -89,14 +95,20 @@ static isp_awb_ctlr_t awb_ctrl = NULL;
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static esp_cam_sensor_device_t *cam_sensor = NULL;
 
+// PPA (Pixel Processing Accelerator) for scaling
+static ppa_client_handle_t ppa_client = NULL;
+static SemaphoreHandle_t ppa_done_sem = NULL;
+
 // LVGL display objects
 static lv_obj_t *preview_parent = NULL;
 static lv_obj_t *preview_canvas = NULL;
 static lv_display_t *display = NULL;
 
-// Frame buffer (used by both Camera Controller and LVGL)
-static void *frame_buffer = NULL;
+// Frame buffers
+static void *frame_buffer = NULL;       // Camera output buffer (1288x728)
 static size_t frame_buffer_size = 0;
+static void *scaled_buffer = NULL;      // Scaled buffer for display (480x800)
+static size_t scaled_buffer_size = 0;
 
 // Camera transaction descriptor
 static esp_cam_ctlr_trans_t frame_trans = {0};
@@ -110,6 +122,9 @@ static int64_t last_frame_time_us = 0;
 
 /**
  * Camera callback: Provide new buffer for next frame
+ * 
+ * This callback is called by the camera controller to get a buffer for the next frame.
+ * We provide our pre-allocated frame buffer which the ISP will write into.
  */
 static bool camera_get_new_vb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data)
 {
@@ -118,11 +133,17 @@ static bool camera_get_new_vb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t
     trans->buffer = new_trans.buffer;
     trans->buflen = new_trans.buflen;
 
-    return false;
+    // Return true to indicate we successfully provided a buffer
+    // Returning false would tell the driver we couldn't provide a buffer,
+    // which could cause it to stop requesting frames!
+    return true;
 }
 
 /**
  * Camera callback: Frame reception finished
+ * 
+ * This callback is fired by the camera controller when a frame is ready.
+ * We signal the preview task and return true to release the buffer back to the driver.
  */
 static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data)
 {
@@ -134,8 +155,9 @@ static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_tra
     // Use system tick count (safe in ISR) - will measure in task
     last_callback_time = xTaskGetTickCountFromISR();
     
-    // Log first few callbacks for debugging
-    if (callback_count <= 10) {
+    // Log callbacks to debug why they stop after frame 10
+    // Log first 20 frames, then every 10th
+    if (callback_count <= 20 || callback_count % 10 == 0) {
         ESP_EARLY_LOGI(TAG, "Frame callback #%lu triggered", callback_count);
     }
     
@@ -144,7 +166,76 @@ static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_tra
         xSemaphoreGiveFromISR(frame_ready_sem, &high_task_woken);
     }
     
+    // IMPORTANT: Return true to release buffer back to camera controller
+    // The ISP outputs to our pre-allocated buffer, so the trans buffer is just metadata
+    // and can be reused immediately. Returning false would block the driver!
+    return true;
+}
+
+/**
+ * PPA callback: Called when scaling operation completes
+ */
+static bool ppa_transaction_done_cb(ppa_client_handle_t ppa_client, 
+                                   ppa_event_data_t *event_data, void *user_data)
+{
+    BaseType_t high_task_woken = pdFALSE;
+    
+    // DEBUG: Log callback entry
+    static uint32_t callback_count = 0;
+    callback_count++;
+    
+    // Signal that PPA scaling is complete
+    if (ppa_done_sem) {
+        xSemaphoreGiveFromISR(ppa_done_sem, &high_task_woken);
+        // Log every 10th callback to avoid spam
+        if (callback_count <= 10 || callback_count % 10 == 0) {
+            ESP_EARLY_LOGI(TAG, "PPA callback #%lu fired, semaphore signaled", callback_count);
+        }
+    } else {
+        ESP_EARLY_LOGE(TAG, "PPA callback fired but semaphore is NULL!");
+    }
+    
     return high_task_woken == pdTRUE;
+}
+
+/**
+ * Initialize PPA (Pixel Processing Accelerator) for scaling
+ */
+static esp_err_t init_ppa(void)
+{
+    ESP_LOGI(TAG, "Initializing PPA for scaling %dx%d → %dx%d...", 
+             CAMERA_HRES, CAMERA_VRES, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+    
+    // Register PPA client for Scale-Rotate-Mirror (SRM) operation
+    ppa_client_config_t ppa_config = {
+        .oper_type = PPA_OPERATION_SRM,  // Scale-Rotate-Mirror
+        .max_pending_trans_num = 1,
+    };
+    
+    ESP_RETURN_ON_ERROR(
+        ppa_register_client(&ppa_config, &ppa_client),
+        TAG, "Failed to register PPA client"
+    );
+    
+    // Register PPA callback
+    ppa_event_callbacks_t ppa_cbs = {
+        .on_trans_done = ppa_transaction_done_cb,
+    };
+    
+    ESP_RETURN_ON_ERROR(
+        ppa_client_register_event_callbacks(ppa_client, &ppa_cbs),
+        TAG, "Failed to register PPA callbacks"
+    );
+    
+    // Create semaphore for PPA completion
+    ppa_done_sem = xSemaphoreCreateBinary();
+    if (!ppa_done_sem) {
+        ESP_LOGE(TAG, "Failed to create PPA semaphore");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    ESP_LOGI(TAG, "PPA initialized successfully");
+    return ESP_OK;
 }
 
 /**
@@ -351,24 +442,48 @@ static esp_err_t init_preview_display(void)
         return ESP_FAIL;
     }
     
+    // Get display size (Brookesia may return useable area, not full display)
     int32_t display_width = lv_display_get_horizontal_resolution(display);
     int32_t display_height = lv_display_get_vertical_resolution(display);
     
-    ESP_LOGI(TAG, "Display: %dx%d, Camera: %dx%d", 
-             display_width, display_height, CAMERA_HRES, CAMERA_VRES);
+    // Use actual display constants for calculations (not Brookesia-adjusted values)
+    // DISPLAY_WIDTH = 480, DISPLAY_HEIGHT = 800 (full display including status bar)
+    const int STATUS_BAR_HEIGHT = 40;
+    const int USEABLE_HEIGHT = DISPLAY_HEIGHT - STATUS_BAR_HEIGHT; // 800 - 40 = 760
     
-    // Create LVGL canvas for camera preview
+    // Maintain aspect ratio within useable area
+    // Camera: 1288×728 → After 90° rotation: 728×1288
+    // Calculate scale to fit within 480×760
+    float scale_x_ratio = (float)DISPLAY_WIDTH / CAMERA_VRES;    // 480/728 = 0.659
+    float scale_y_ratio = (float)USEABLE_HEIGHT / CAMERA_HRES;   // 760/1288 = 0.590
+    float scale = (scale_x_ratio < scale_y_ratio) ? scale_x_ratio : scale_y_ratio;  // 0.590
+    
+    int canvas_width = (int)(CAMERA_VRES * scale);   // 728 * 0.590 = 429
+    int canvas_height = (int)(CAMERA_HRES * scale);  // 1288 * 0.590 = 760
+    
+    // Center canvas horizontally in the useable area
+    int canvas_x = (DISPLAY_WIDTH - canvas_width) / 2;  // (480 - 429) / 2 = 26
+    int canvas_y = 0;  // Align to top of useable area
+    
+    ESP_LOGI(TAG, "Display query: %dx%d, Display constants: %dx%d (useable: %dx%d), Camera: %dx%d, Canvas: %dx%d at (%d,%d)", 
+             display_width, display_height, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH, USEABLE_HEIGHT,
+             CAMERA_HRES, CAMERA_VRES, canvas_width, canvas_height, canvas_x, canvas_y);
+    
+    // Create LVGL canvas for scaled camera preview
     preview_canvas = lv_canvas_create(preview_parent);
     if (!preview_canvas) {
         ESP_LOGE(TAG, "Failed to create LVGL canvas");
         return ESP_FAIL;
     }
     
-    // Center and fit the canvas on screen
-    lv_obj_set_size(preview_canvas, CAMERA_HRES, CAMERA_VRES);
-    lv_obj_center(preview_canvas);
+    // Set canvas size and position
+    lv_obj_set_size(preview_canvas, canvas_width, canvas_height);
+    lv_obj_set_pos(preview_canvas, canvas_x, canvas_y);  // Centered horizontally
+    // Disable scrolling
+    lv_obj_clear_flag(preview_canvas, LV_OBJ_FLAG_SCROLLABLE);
     
-    ESP_LOGI(TAG, "LVGL canvas created successfully");
+    ESP_LOGI(TAG, "LVGL canvas created at %dx%d, positioned at (%d,%d), no scrolling",
+             canvas_width, canvas_height, canvas_x, canvas_y);
     
     return ESP_OK;
 }
@@ -398,7 +513,8 @@ static void preview_task(void *pvParameters)
         
         // Wait for callback notification that frame is ready
         if (xSemaphoreTake(frame_ready_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
-            ESP_LOGW(TAG, "Frame timeout - no callback received in 1 second");
+            ESP_LOGE(TAG, "⚠️  FRAME TIMEOUT after frame #%lu - no callback received in 1 second!", frame_count);
+            ESP_LOGE(TAG, "    This means camera callbacks stopped firing!");
             continue;
         }
         
@@ -451,22 +567,117 @@ static void preview_task(void *pvParameters)
                         frame_count, pixels[0], pixels[mid_idx], pixels[corner_idx]);
             }
             
-            // Update LVGL canvas with new frame
-            if (preview_canvas) {
-                // Acquire LVGL lock for thread-safe access (critical!)
-                // This prevents race conditions with LVGL's render task
-                lv_lock();
+            // Scale frame using PPA to fill display (1288x728 → 480x760, no borders)
+            int64_t ppa_start = esp_timer_get_time();
+            
+            if (ppa_client && scaled_buffer) {
+                // Maintain aspect ratio to avoid PPA constraints
+                // Camera: 1288×728 (landscape) → After 90° CW rotation: 728×1288 (portrait)
+                // Target: Fit within 480×760 (useable display area)
                 
-                // Update canvas buffer to point to the new frame
-                lv_canvas_set_buffer(preview_canvas, frame_trans.buffer, 
-                                   CAMERA_HRES, CAMERA_VRES, 
-                                   LV_COLOR_FORMAT_RGB565);
+                const int STATUS_BAR_HEIGHT = 40;
+                const int USEABLE_HEIGHT = DISPLAY_HEIGHT - STATUS_BAR_HEIGHT; // 760
                 
-                // Invalidate to trigger LVGL refresh (non-blocking)
-                lv_obj_invalidate(preview_canvas);
+                // After 90° rotation: 728×1288 → Need to fit in 480×760
+                // Calculate scale to fit both dimensions (maintain aspect ratio)
+                float scale_x_ratio = (float)DISPLAY_WIDTH / CAMERA_VRES;    // 480/728 = 0.659
+                float scale_y_ratio = (float)USEABLE_HEIGHT / CAMERA_HRES;   // 760/1288 = 0.590
                 
-                // Release LVGL lock immediately
-                lv_unlock();
+                // Use the SMALLER scale to ensure both dimensions fit
+                float scale = (scale_x_ratio < scale_y_ratio) ? scale_x_ratio : scale_y_ratio;  // 0.590
+                
+                // Calculate actual output dimensions (will have borders on one axis)
+                int output_width = (int)(CAMERA_VRES * scale);   // 728 * 0.590 = 429
+                int output_height = (int)(CAMERA_HRES * scale);  // 1288 * 0.590 = 760
+
+                // PPA configuration with uniform scaling
+                ppa_srm_oper_config_t srm_config = {
+                    .in = {
+                        .buffer = frame_trans.buffer,
+                        .pic_w = CAMERA_HRES,  // 1288 (landscape width)
+                        .pic_h = CAMERA_VRES,  // 728 (landscape height)
+                        .block_w = CAMERA_HRES,
+                        .block_h = CAMERA_VRES,
+                        .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                    },
+                    .out = {
+                        .buffer = scaled_buffer,
+                        .buffer_size = scaled_buffer_size,
+                        .pic_w = output_width,      // 429 (maintains aspect ratio)
+                        .pic_h = output_height,     // 760 (fits height exactly)
+                        .block_offset_x = 0,
+                        .block_offset_y = 0,
+                        .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                    },
+                    .rotation_angle = PPA_SRM_ROTATION_ANGLE_90,  // 90° clockwise
+                    .scale_x = scale,  // 0.590 (uniform scaling)
+                    .scale_y = scale,  // 0.590 (uniform scaling)
+                    .mirror_x = false,
+                    .mirror_y = false,
+                    .rgb_swap = false,
+                    .byte_swap = false,
+                    .alpha_update_mode = PPA_ALPHA_NO_CHANGE,
+                    .mode = PPA_TRANS_MODE_NON_BLOCKING,  // Non-blocking to avoid deadlock
+                    .user_data = NULL,
+                };
+                
+                // DEBUG: Log before PPA call
+                if (frame_count <= 10) {
+                    ESP_LOGI(TAG, "Frame #%lu - Starting PPA operation (non-blocking)...", frame_count);
+                }
+                
+                // Start PPA scaling operation (non-blocking - returns immediately)
+                esp_err_t ppa_ret = ppa_do_scale_rotate_mirror(ppa_client, &srm_config);
+                
+                // DEBUG: Log PPA return
+                if (frame_count <= 10) {
+                    ESP_LOGI(TAG, "Frame #%lu - PPA call returned: %s", 
+                            frame_count, esp_err_to_name(ppa_ret));
+                }
+                
+                if (ppa_ret == ESP_OK) {
+                    // DEBUG: Log before semaphore wait
+                    if (frame_count <= 10) {
+                        ESP_LOGI(TAG, "Frame #%lu - Waiting for PPA semaphore (100ms timeout)...", frame_count);
+                    }
+                    
+                    // Wait for PPA callback to signal completion
+                    BaseType_t sem_result = xSemaphoreTake(ppa_done_sem, pdMS_TO_TICKS(100));
+                    
+                    // DEBUG: Log semaphore result
+                    if (frame_count <= 10) {
+                        ESP_LOGI(TAG, "Frame #%lu - Semaphore result: %s", 
+                                frame_count, sem_result == pdTRUE ? "SUCCESS" : "TIMEOUT");
+                    }
+                    
+                    if (sem_result == pdTRUE) {
+                        // PPA operation complete, sync cache
+                        esp_cache_msync(scaled_buffer, scaled_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                        
+                        int64_t ppa_end = esp_timer_get_time();
+                        
+                        // Update LVGL canvas with scaled frame
+                        if (preview_canvas) {
+                            lv_lock();
+                            lv_canvas_set_buffer(preview_canvas, scaled_buffer, 
+                                               output_width, output_height,  // 429×760 (aspect ratio preserved)
+                                               LV_COLOR_FORMAT_RGB565);
+                            lv_obj_invalidate(preview_canvas);
+                            lv_unlock();
+                        }
+                        
+                        // Log PPA timing for first 10 frames
+                        if (frame_count <= 10) {
+                            int64_t ppa_time_us = ppa_end - ppa_start;
+                            ESP_LOGI(TAG, "Frame #%lu - PPA: %lld us, scaled to %dx%d (scale=%.3f)", 
+                                    frame_count, ppa_time_us, output_width, output_height, scale);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "PPA timeout waiting for completion");
+                    }
+                } else {
+                    ESP_LOGW(TAG, "PPA operation failed: %s", esp_err_to_name(ppa_ret));
+                }
             }
             
             int64_t processing_end = esp_timer_get_time();
@@ -476,7 +687,7 @@ static void preview_task(void *pvParameters)
                 int64_t cache_sync_time_us = cache_sync_end - cache_sync_start;
                 int64_t total_processing_us = processing_end - processing_start;
                 
-                ESP_LOGI(TAG, "Frame #%lu timing - Cache sync: %lld us, Canvas update: %lld us", 
+                ESP_LOGI(TAG, "Frame #%lu timing - Cache sync: %lld us, Total: %lld us", 
                         frame_count, cache_sync_time_us, total_processing_us);
             }
             
@@ -555,11 +766,36 @@ esp_err_t camera_start(void)
         frame_trans.buflen = frame_buffer_size;
     }
     
-    // Create semaphore
+    // Allocate scaled buffer for display
+    if (!scaled_buffer) {
+        size_t raw_scaled_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * RGB565_BITS_PER_PIXEL / 8;
+        scaled_buffer_size = (raw_scaled_size + 127) & ~127;  // Align to 128 bytes
+        ESP_LOGI(TAG, "Allocating scaled buffer: %zu bytes (raw: %zu)", scaled_buffer_size, raw_scaled_size);
+        
+        scaled_buffer = heap_caps_aligned_calloc(128, 1, scaled_buffer_size, 
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!scaled_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate scaled buffer");
+            return ESP_ERR_NO_MEM;
+        }
+        
+        ESP_LOGI(TAG, "Scaled buffer allocated in PSRAM");
+        memset(scaled_buffer, 0xFF, scaled_buffer_size);
+        esp_cache_msync(scaled_buffer, scaled_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    }
+    
+    // Initialize PPA if not done
+    if (!ppa_client) {
+        ESP_RETURN_ON_ERROR(init_ppa(), TAG, "PPA initialization failed");
+    }
+    
+    // Create semaphore for frame ready notifications
+    // Use counting semaphore (not binary) to handle multiple frame callbacks
+    // that arrive faster than we can process them (camera @ 30fps, PPA takes ~47ms)
     if (!frame_ready_sem) {
-        frame_ready_sem = xSemaphoreCreateBinary();
+        frame_ready_sem = xSemaphoreCreateCounting(10, 0);  // Max 10 pending frames, start at 0
         if (!frame_ready_sem) {
-            ESP_LOGE(TAG, "Failed to create semaphore");
+            ESP_LOGE(TAG, "Failed to create frame ready semaphore");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -812,14 +1048,31 @@ void camera_deinit(void)
         cam_handle = NULL;
     }
     
+    // Unregister PPA client
+    if (ppa_client) {
+        ppa_unregister_client(ppa_client);
+        ppa_client = NULL;
+    }
+    
+    // Delete PPA semaphore
+    if (ppa_done_sem) {
+        vSemaphoreDelete(ppa_done_sem);
+        ppa_done_sem = NULL;
+    }
+    
     // Clean up display reference
     display = NULL;
     preview_canvas = NULL;
     
-    // Free frame buffer
+    // Free frame buffers
     if (frame_buffer) {
         heap_caps_free(frame_buffer);
         frame_buffer = NULL;
+    }
+    
+    if (scaled_buffer) {
+        heap_caps_free(scaled_buffer);
+        scaled_buffer = NULL;
     }
     
     // Delete semaphore
