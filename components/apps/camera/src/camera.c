@@ -103,12 +103,16 @@ static SemaphoreHandle_t ppa_done_sem = NULL;
 static lv_obj_t *preview_parent = NULL;
 static lv_obj_t *preview_canvas = NULL;
 static lv_display_t *display = NULL;
+static lv_timer_t *update_timer = NULL;
 
 // Frame buffers
 static void *frame_buffer = NULL;       // Camera output buffer (1288x728)
 static size_t frame_buffer_size = 0;
 static void *scaled_buffer = NULL;      // Scaled buffer for display (480x800)
 static size_t scaled_buffer_size = 0;
+
+// Flag to indicate new frame is ready for display
+static volatile bool frame_ready_for_display = false;
 
 // Camera transaction descriptor
 static esp_cam_ctlr_trans_t frame_trans = {0};
@@ -119,6 +123,11 @@ static TaskHandle_t preview_task_handle = NULL;
 // Timing measurement variables (use TickType_t for ISR-safe timing)
 static TickType_t last_callback_time = 0;
 static int64_t last_frame_time_us = 0;
+
+// Diagnostic counters for debugging freeze issue
+static uint32_t ppa_callback_count = 0;
+static uint32_t semaphore_overflow_count = 0;
+static uint32_t lvgl_lock_timeout_count = 0;
 
 /**
  * Camera callback: Provide new buffer for next frame
@@ -144,26 +153,51 @@ static bool camera_get_new_vb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t
  * 
  * This callback is fired by the camera controller when a frame is ready.
  * We signal the preview task and return true to release the buffer back to the driver.
+ * 
+ * Frame skipping: Camera captures at 30 FPS but PPA can only process at 13 FPS.
+ * To prevent queue buildup, we skip frames (process every 2nd frame = ~15 FPS target).
  */
 static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data)
 {
     BaseType_t high_task_woken = pdFALSE;
     
     static uint32_t callback_count = 0;
+    static uint32_t skipped_count = 0;
     callback_count++;
     
     // Use system tick count (safe in ISR) - will measure in task
     last_callback_time = xTaskGetTickCountFromISR();
     
-    // Log callbacks to debug why they stop after frame 10
-    // Log first 20 frames, then every 10th
-    if (callback_count <= 20 || callback_count % 10 == 0) {
-        ESP_EARLY_LOGI(TAG, "Frame callback #%lu triggered", callback_count);
+    // FRAME SKIPPING: Process every 3rd frame to match PPA throughput
+    // Camera: 30 FPS → Process 1/3 → 10 FPS
+    // PPA: 13 FPS theoretical, but ~10-11 FPS actual → Perfect match, no queue buildup
+    if (callback_count % 3 != 0) {
+        skipped_count++;
+        // Log skipped frames periodically
+        if (skipped_count <= 10 || skipped_count % 50 == 0) {
+            ESP_EARLY_LOGI(TAG, "Frame #%lu skipped (skip rate: 2/3)", callback_count);
+        }
+        return true;  // Skip this frame, just release buffer
     }
     
-    // Signal the preview task that a new frame is ready
+    // Log processed callbacks to confirm frame skipping working
+    // Log first 20 frames, then every 10th
+    if (callback_count <= 20 || callback_count % 10 == 0) {
+        ESP_EARLY_LOGI(TAG, "Frame callback #%lu triggered (processing)", callback_count);
+    }
+    
+    // Signal the preview task that a new frame is ready for processing
+    BaseType_t result = pdFAIL;
     if (frame_ready_sem) {
-        xSemaphoreGiveFromISR(frame_ready_sem, &high_task_woken);
+        result = xSemaphoreGiveFromISR(frame_ready_sem, &high_task_woken);
+        
+        // Track semaphore overflow (semaphore full, frame dropped)
+        if (result == pdFAIL) {
+            semaphore_overflow_count++;
+            if (semaphore_overflow_count % 10 == 0) {
+                ESP_EARLY_LOGW(TAG, "⚠️ Frame semaphore FULL! Dropped %lu frames total", semaphore_overflow_count);
+            }
+        }
     }
     
     // IMPORTANT: Return true to release buffer back to camera controller
@@ -180,16 +214,15 @@ static bool ppa_transaction_done_cb(ppa_client_handle_t ppa_client,
 {
     BaseType_t high_task_woken = pdFALSE;
     
-    // DEBUG: Log callback entry
-    static uint32_t callback_count = 0;
-    callback_count++;
+    // Track PPA callback count (separate from camera callbacks)
+    ppa_callback_count++;
     
     // Signal that PPA scaling is complete
     if (ppa_done_sem) {
         xSemaphoreGiveFromISR(ppa_done_sem, &high_task_woken);
         // Log every 10th callback to avoid spam
-        if (callback_count <= 10 || callback_count % 10 == 0) {
-            ESP_EARLY_LOGI(TAG, "PPA callback #%lu fired, semaphore signaled", callback_count);
+        if (ppa_callback_count <= 10 || ppa_callback_count % 10 == 0) {
+            ESP_EARLY_LOGI(TAG, "PPA callback #%lu fired, semaphore signaled", ppa_callback_count);
         }
     } else {
         ESP_EARLY_LOGE(TAG, "PPA callback fired but semaphore is NULL!");
@@ -469,7 +502,8 @@ static esp_err_t init_preview_display(void)
              display_width, display_height, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH, USEABLE_HEIGHT,
              CAMERA_HRES, CAMERA_VRES, canvas_width, canvas_height, canvas_x, canvas_y);
     
-    // Create LVGL canvas for scaled camera preview
+    // Create LVGL canvas for camera preview
+    // The canvas will be updated by the LVGL timer callback using lv_canvas_set_buffer()
     preview_canvas = lv_canvas_create(preview_parent);
     if (!preview_canvas) {
         ESP_LOGE(TAG, "Failed to create LVGL canvas");
@@ -478,14 +512,53 @@ static esp_err_t init_preview_display(void)
     
     // Set canvas size and position
     lv_obj_set_size(preview_canvas, canvas_width, canvas_height);
-    lv_obj_set_pos(preview_canvas, canvas_x, canvas_y);  // Centered horizontally
-    // Disable scrolling
+    lv_obj_set_pos(preview_canvas, canvas_x, canvas_y);
     lv_obj_clear_flag(preview_canvas, LV_OBJ_FLAG_SCROLLABLE);
     
-    ESP_LOGI(TAG, "LVGL canvas created at %dx%d, positioned at (%d,%d), no scrolling",
+    // Initialize canvas with scaled_buffer (will be updated by timer)
+    // Note: We don't set the buffer here, the timer will do it
+    
+    ESP_LOGI(TAG, "LVGL canvas created at %dx%d, positioned at (%d,%d)", 
              canvas_width, canvas_height, canvas_x, canvas_y);
+    ESP_LOGI(TAG, "Canvas buffer will be updated by LVGL timer callback (safe thread context)");
     
     return ESP_OK;
+}
+
+/**
+ * LVGL timer callback: Updates display framebuffer from LVGL thread
+ * 
+ * This runs in the LVGL thread context (safe to access LVGL objects)
+ * The camera task signals when a new frame is ready via frame_ready_for_display flag
+ */
+static void display_update_timer_cb(lv_timer_t *timer)
+{
+    // Check if camera is still running
+    if (!preview_running) {
+        return;
+    }
+    
+    // Check if new frame is available
+    if (!frame_ready_for_display || !scaled_buffer || !display) {
+        return;
+    }
+    
+    // Clear flag immediately to avoid re-processing same frame
+    frame_ready_for_display = false;
+    
+    static uint32_t update_count = 0;
+    update_count++;
+    
+    // Sync scaled buffer cache before LVGL reads it
+    esp_cache_msync(scaled_buffer, scaled_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    
+    // Update canvas buffer pointer - LVGL will handle the rendering
+    // This is safe because we're in the LVGL thread (timer callback)
+    lv_canvas_set_buffer(preview_canvas, scaled_buffer, 429, 760, LV_COLOR_FORMAT_RGB565);
+    
+    if (update_count <= 10) {
+        ESP_LOGI(TAG, "Display update #%lu - Canvas buffer updated (using lv_canvas_set_buffer)", update_count);
+    }
 }
 
 /**
@@ -513,9 +586,18 @@ static void preview_task(void *pvParameters)
         
         // Wait for callback notification that frame is ready
         if (xSemaphoreTake(frame_ready_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            // Get semaphore count to diagnose the issue
+            UBaseType_t sem_count = uxSemaphoreGetCount(frame_ready_sem);
             ESP_LOGE(TAG, "⚠️  FRAME TIMEOUT after frame #%lu - no callback received in 1 second!", frame_count);
-            ESP_LOGE(TAG, "    This means camera callbacks stopped firing!");
+            ESP_LOGE(TAG, "    Semaphore count: %u, Dropped frames: %lu", sem_count, semaphore_overflow_count);
+            ESP_LOGE(TAG, "    Camera callbacks should be firing - check if they stopped!");
             continue;
+        }
+        
+        // Check semaphore backlog (how many pending frames)
+        UBaseType_t sem_count = uxSemaphoreGetCount(frame_ready_sem);
+        if (sem_count > 5) {
+            ESP_LOGW(TAG, "⚠️ Semaphore backlog: %u pending frames queued", sem_count);
         }
         
         // Frame is ready in frame_trans.buffer (set by callbacks)
@@ -652,25 +734,28 @@ static void preview_task(void *pvParameters)
                     
                     if (sem_result == pdTRUE) {
                         // PPA operation complete, sync cache
+                        int64_t cache_start = esp_timer_get_time();
                         esp_cache_msync(scaled_buffer, scaled_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                        int64_t cache_end = esp_timer_get_time();
                         
                         int64_t ppa_end = esp_timer_get_time();
                         
-                        // Update LVGL canvas with scaled frame
-                        if (preview_canvas) {
-                            lv_lock();
-                            lv_canvas_set_buffer(preview_canvas, scaled_buffer, 
-                                               output_width, output_height,  // 429×760 (aspect ratio preserved)
-                                               LV_COLOR_FORMAT_RGB565);
-                            lv_obj_invalidate(preview_canvas);
-                            lv_unlock();
+                        // Signal that a new frame is ready for display
+                        // The LVGL timer callback will handle the actual framebuffer update
+                        // This avoids accessing LVGL objects from the camera task
+                        frame_ready_for_display = true;
+                        
+                        if (frame_count <= 10) {
+                            ESP_LOGI(TAG, "Frame #%lu - Scaled frame ready for display (PPA: %lld us, Cache: %lld us)", 
+                                    frame_count, ppa_end - ppa_start, cache_end - cache_start);
                         }
                         
                         // Log PPA timing for first 10 frames
                         if (frame_count <= 10) {
                             int64_t ppa_time_us = ppa_end - ppa_start;
-                            ESP_LOGI(TAG, "Frame #%lu - PPA: %lld us, scaled to %dx%d (scale=%.3f)", 
-                                    frame_count, ppa_time_us, output_width, output_height, scale);
+                            int64_t cache_time_us = cache_end - cache_start;
+                            ESP_LOGI(TAG, "Frame #%lu - PPA: %lld us, Cache: %lld us, scaled to %dx%d (scale=%.3f)", 
+                                    frame_count, ppa_time_us, cache_time_us, output_width, output_height, scale);
                         }
                     } else {
                         ESP_LOGW(TAG, "PPA timeout waiting for completion");
@@ -697,10 +782,13 @@ static void preview_task(void *pvParameters)
             // Reset watchdog for this task
             esp_task_wdt_reset();
             
-            // Log frame rate every second
+            // Log comprehensive frame rate info every second
             TickType_t now = xTaskGetTickCount();
             if ((now - last_log_time) >= pdMS_TO_TICKS(1000)) {
-                ESP_LOGI(TAG, "Frame rate: %lu fps", frame_count);
+                UBaseType_t sem_count = uxSemaphoreGetCount(frame_ready_sem);
+                ESP_LOGI(TAG, "📊 Status: %lu fps | Callbacks: cam=%lu ppa=%lu | Dropped: %lu | LVGL fails: %lu | Queue: %u", 
+                        frame_count, frame_count, ppa_callback_count, 
+                        semaphore_overflow_count, lvgl_lock_timeout_count, sem_count);
                 frame_count = 0;
                 last_log_time = now;
             }
@@ -945,6 +1033,23 @@ esp_err_t camera_start(void)
         return ESP_FAIL;
     }
     
+    // Create LVGL timer to update display (runs in LVGL thread context)
+    // This safely handles canvas updates without cross-thread LVGL access
+    // Set to ~13 FPS (77ms) to match PPA throughput and avoid frame queue buildup
+    bsp_display_lock(0);
+    update_timer = lv_timer_create(display_update_timer_cb, 77, NULL);  // ~13 FPS (matches PPA speed)
+    if (!update_timer) {
+        ESP_LOGE(TAG, "Failed to create display update timer");
+        bsp_display_unlock();
+        preview_running = false;
+        esp_cam_ctlr_stop(cam_handle);
+        vTaskDelete(preview_task_handle);
+        return ESP_FAIL;
+    }
+    bsp_display_unlock();
+    
+    ESP_LOGI(TAG, "Display update timer created (77ms interval, ~13 FPS to match PPA)");
+    
     // Note: Task will call esp_cam_ctlr_receive() in its loop (like the example)
     ESP_LOGI(TAG, "Camera started successfully");
     return ESP_OK;
@@ -975,6 +1080,15 @@ esp_err_t camera_stop(void)
     // Stop camera controller
     if (cam_handle) {
         esp_cam_ctlr_stop(cam_handle);
+    }
+    
+    // Delete LVGL update timer
+    if (update_timer) {
+        bsp_display_lock(0);
+        lv_timer_delete(update_timer);
+        update_timer = NULL;
+        bsp_display_unlock();
+        ESP_LOGI(TAG, "Display update timer deleted");
     }
     
     // Signal task to stop
