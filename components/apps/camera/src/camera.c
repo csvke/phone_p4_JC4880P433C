@@ -42,6 +42,7 @@
 #include "driver/isp_color.h"
 #include "driver/i2c_master.h"
 #include "driver/ppa.h"  // Pixel Processing Accelerator for scaling
+#include "esp_async_memcpy.h"  // Hardware DMA for fast PSRAM memcpy
 
 // Camera Sensor API
 #include "esp_cam_sensor.h"
@@ -58,14 +59,15 @@
 static const char *TAG = "camera";
 
 // Camera configuration (from sdkconfig.defaults)
-// PRODUCTION: OV02C10 1-lane 1288x728 - stable 30.1 FPS (validated)
+// PRODUCTION: OV02C10 1-lane 1288x728 - stable 30+ FPS with async DMA
 // Frame buffer size: 1288x728x2 = 1,875,968 bytes (~1.8MB)
+// With async DMA: ~16ms transfer time, leaving headroom for 30+ FPS
 #define CAMERA_HRES 1288
 #define CAMERA_VRES 728
 #define CAMERA_LANE_BITRATE_MBPS 400
 #define CAMERA_DATA_LANES 1
 
-// // Testing: 1920x1080 maxes at 11.1 FPS (blanking limited)
+// Testing: 2-lane 1920x1080 achieved 23 FPS with async DMA
 // #define CAMERA_HRES 1920
 // #define CAMERA_VRES 1080
 // #define CAMERA_LANE_BITRATE_MBPS 400
@@ -99,6 +101,13 @@ static esp_cam_sensor_device_t *cam_sensor = NULL;
 static ppa_client_handle_t ppa_client = NULL;
 static SemaphoreHandle_t ppa_done_sem = NULL;
 
+// DMA for fast PSRAM memcpy (replaces slow CPU memcpy)
+// Uses async callback - no separate semaphore needed
+static async_memcpy_handle_t dma_handle = NULL;
+
+// Forward declarations
+static esp_err_t init_isp_processor(void);
+
 // LVGL display objects
 static lv_obj_t *preview_parent = NULL;
 static lv_obj_t *preview_canvas = NULL;
@@ -128,6 +137,27 @@ static int64_t last_frame_time_us = 0;
 static uint32_t ppa_callback_count = 0;
 static uint32_t semaphore_overflow_count = 0;
 static uint32_t lvgl_lock_timeout_count = 0;
+
+/**
+ * DMA callback: Called when async memcpy completes
+ * Runs in ISR context - must be fast and use ISR-safe functions only
+ * 
+ * This signals that the frame is ready for display after DMA completes.
+ */
+static bool IRAM_ATTR dma_done_callback(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args)
+{
+    // Mark frame as ready for display (DMA completed successfully)
+    // The LVGL timer will poll this flag and update the display
+    frame_ready_for_display = true;
+    
+    // DO NOT signal frame_ready_sem here! That semaphore is for camera frames only.
+    // The camera ISR signals when a new frame is captured (camera_trans_finished).
+    // The preview task processes camera frames immediately (launches DMA).
+    // The LVGL timer polls frame_ready_for_display to update display when DMA completes.
+    
+    // No need to wake any task - LVGL timer runs independently
+    return false;  // No higher priority task woken
+}
 
 /**
  * Camera callback: Provide new buffer for next frame
@@ -162,28 +192,15 @@ static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_tra
     BaseType_t high_task_woken = pdFALSE;
     
     static uint32_t callback_count = 0;
-    static uint32_t skipped_count = 0;
     callback_count++;
     
     // Use system tick count (safe in ISR) - will measure in task
     last_callback_time = xTaskGetTickCountFromISR();
     
-    // FRAME SKIPPING: Process every 3rd frame to match PPA throughput
-    // Camera: 30 FPS → Process 1/3 → 10 FPS
-    // PPA: 13 FPS theoretical, but ~10-11 FPS actual → Perfect match, no queue buildup
-    if (callback_count % 3 != 0) {
-        skipped_count++;
-        // Log skipped frames periodically
-        if (skipped_count <= 10 || skipped_count % 50 == 0) {
-            ESP_EARLY_LOGI(TAG, "Frame #%lu skipped (skip rate: 2/3)", callback_count);
-        }
-        return true;  // Skip this frame, just release buffer
-    }
-    
-    // Log processed callbacks to confirm frame skipping working
-    // Log first 20 frames, then every 10th
-    if (callback_count <= 20 || callback_count % 10 == 0) {
-        ESP_EARLY_LOGI(TAG, "Frame callback #%lu triggered (processing)", callback_count);
+    // NO FRAME SKIPPING: With PPA rotation-only (~5-10ms), should handle all 30 FPS
+    // Log first 20 frames, then every 30th to monitor performance
+    if (callback_count <= 20 || callback_count % 30 == 0) {
+        ESP_EARLY_LOGI(TAG, "Frame callback #%lu (processing all frames, PPA rotation-only)", callback_count);
     }
     
     // Signal the preview task that a new frame is ready for processing
@@ -284,11 +301,48 @@ static esp_err_t init_camera_controller(void)
         .v_res = CAMERA_VRES,
         .lane_bit_rate_mbps = CAMERA_LANE_BITRATE_MBPS,
         .input_data_color_type = CAM_CTLR_COLOR_RAW10,  // OV02C10 outputs RAW10
-        .output_data_color_type = CAM_CTLR_COLOR_RGB565,
+        .output_data_color_type = CAM_CTLR_COLOR_RGB565,  // ISP converts RAW10 → RGB565
         .data_lane_num = CAMERA_DATA_LANES,
         .byte_swap_en = false,
-        .queue_items = 1,
+        .queue_items = 2,  // INCREASED: Test if buffer queue depth affects frame rate
     };
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 🔍 DETAILED CSI/ISP TIMING DIAGNOSTICS
+    // ═══════════════════════════════════════════════════════════════════════════
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║           CSI CONTROLLER CONFIGURATION                       ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "  Resolution:        %d × %d pixels", CAMERA_HRES, CAMERA_VRES);
+    ESP_LOGI(TAG, "  Frame size:        %d bytes (RGB565)", CAMERA_HRES * CAMERA_VRES * 2);
+    ESP_LOGI(TAG, "  Data lanes:        %d", CAMERA_DATA_LANES);
+    ESP_LOGI(TAG, "  Lane bit rate:     %d Mbps per lane", CAMERA_LANE_BITRATE_MBPS);
+    ESP_LOGI(TAG, "  Total bandwidth:   %d Mbps (%d lanes × %d Mbps)", 
+             CAMERA_LANE_BITRATE_MBPS * CAMERA_DATA_LANES, 
+             CAMERA_DATA_LANES, 
+             CAMERA_LANE_BITRATE_MBPS);
+    ESP_LOGI(TAG, "  Input format:      RAW10 (10 bits per pixel)");
+    ESP_LOGI(TAG, "  Output format:     RGB565 (16 bits per pixel, ISP Demosaic)");
+    ESP_LOGI(TAG, "");
+    
+    // Calculate expected frame delivery time
+    uint32_t raw10_frame_bits = CAMERA_HRES * CAMERA_VRES * 10;  // 10 bits per pixel
+    uint32_t total_bandwidth_bps = (uint64_t)CAMERA_LANE_BITRATE_MBPS * CAMERA_DATA_LANES * 1000000ULL;
+    uint32_t expected_frame_time_us = ((uint64_t)raw10_frame_bits * 1000000ULL) / total_bandwidth_bps;
+    float expected_fps = 1000000.0f / expected_frame_time_us;
+    
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║           THEORETICAL PERFORMANCE                            ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "  RAW10 frame size:  %d bits", raw10_frame_bits);
+    ESP_LOGI(TAG, "  Expected transfer: %d μs per frame", expected_frame_time_us);
+    ESP_LOGI(TAG, "  Expected FPS:      %.1f FPS (MIPI bandwidth only)", expected_fps);
+    ESP_LOGI(TAG, "  Sensor configured: ~27 FPS (HTS=2280, VTS=1164, 81.67MHz)");
+    ESP_LOGI(TAG, "  ⚠️  ACTUAL FPS:    ~8.3 FPS (120ms intervals) ← MYSTERY!");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "  🎯 Goal: Find where the 120ms frame interval comes from");
+    ESP_LOGI(TAG, "");
     
     ESP_RETURN_ON_ERROR(
         esp_cam_new_csi_ctlr(&csi_config, &cam_handle),
@@ -312,6 +366,7 @@ static esp_err_t init_camera_controller(void)
     );
     
     ESP_LOGI(TAG, "CSI camera controller initialized");
+    
     return ESP_OK;
 }
 
@@ -320,7 +375,10 @@ static esp_err_t init_camera_controller(void)
  */
 static esp_err_t init_isp_processor(void)
 {
-    ESP_LOGI(TAG, "Initializing ISP processor...");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║           ISP PROCESSOR CONFIGURATION                        ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════════╝");
     
     esp_isp_processor_cfg_t isp_config = {
         .clk_hz = ISP_CLK_HZ,
@@ -332,6 +390,13 @@ static esp_err_t init_isp_processor(void)
         .h_res = CAMERA_HRES,
         .v_res = CAMERA_VRES,
     };
+    
+    ESP_LOGI(TAG, "  ISP Clock:         %d Hz (%.1f MHz)", ISP_CLK_HZ, ISP_CLK_HZ / 1000000.0f);
+    ESP_LOGI(TAG, "  Input:             RAW10 (10-bit Bayer from sensor)");
+    ESP_LOGI(TAG, "  Output:            RGB565 (16-bit after Demosaic)");
+    ESP_LOGI(TAG, "  Resolution:        %d × %d", CAMERA_HRES, CAMERA_VRES);
+    ESP_LOGI(TAG, "  Processing:        Demosaic, AWB, Color Correction, Sharpen");
+    ESP_LOGI(TAG, "");
     
     ESP_RETURN_ON_ERROR(
         esp_isp_new_processor(&isp_config, &isp_proc),
@@ -479,48 +544,56 @@ static esp_err_t init_preview_display(void)
     int32_t display_width = lv_display_get_horizontal_resolution(display);
     int32_t display_height = lv_display_get_vertical_resolution(display);
     
-    // Use actual display constants for calculations (not Brookesia-adjusted values)
+    // Use actual display constants for calculations
     // DISPLAY_WIDTH = 480, DISPLAY_HEIGHT = 800 (full display including status bar)
     const int STATUS_BAR_HEIGHT = 40;
     const int USEABLE_HEIGHT = DISPLAY_HEIGHT - STATUS_BAR_HEIGHT; // 800 - 40 = 760
     
-    // Maintain aspect ratio within useable area
-    // Camera: 1288×728 → After 90° rotation: 728×1288
-    // Calculate scale to fit within 480×760
-    float scale_x_ratio = (float)DISPLAY_WIDTH / CAMERA_VRES;    // 480/728 = 0.659
-    float scale_y_ratio = (float)USEABLE_HEIGHT / CAMERA_HRES;   // 760/1288 = 0.590
-    float scale = (scale_x_ratio < scale_y_ratio) ? scale_x_ratio : scale_y_ratio;  // 0.590
+    // Camera outputs CAMERA_HRES×CAMERA_VRES (no rotation, landscape)
+    // We need to scale this to fit within 480x760 useable area
+    // Calculate zoom factor (LVGL uses 256 = 100%)
+    const int PPA_OUTPUT_WIDTH = CAMERA_HRES;   // No rotation (testing bandwidth)
+    const int PPA_OUTPUT_HEIGHT = CAMERA_VRES;
     
-    int canvas_width = (int)(CAMERA_VRES * scale);   // 728 * 0.590 = 429
-    int canvas_height = (int)(CAMERA_HRES * scale);  // 1288 * 0.590 = 760
+    float scale_x = (float)DISPLAY_WIDTH / PPA_OUTPUT_WIDTH;
+    float scale_y = (float)USEABLE_HEIGHT / PPA_OUTPUT_HEIGHT;
+    float scale = (scale_x < scale_y) ? scale_x : scale_y;  // Use smaller to fit both
     
-    // Center canvas horizontally in the useable area
-    int canvas_x = (DISPLAY_WIDTH - canvas_width) / 2;  // (480 - 429) / 2 = 26
-    int canvas_y = 0;  // Align to top of useable area
+    // Convert to LVGL zoom (256 = 100%)
+    uint16_t lvgl_zoom = (uint16_t)(scale * 256);
     
-    ESP_LOGI(TAG, "Display query: %dx%d, Display constants: %dx%d (useable: %dx%d), Camera: %dx%d, Canvas: %dx%d at (%d,%d)", 
-             display_width, display_height, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH, USEABLE_HEIGHT,
-             CAMERA_HRES, CAMERA_VRES, canvas_width, canvas_height, canvas_x, canvas_y);
+    // Calculate final displayed size
+    int display_width_final = (int)(PPA_OUTPUT_WIDTH * scale);
+    int display_height_final = (int)(PPA_OUTPUT_HEIGHT * scale);
     
-    // Create LVGL canvas for camera preview
-    // The canvas will be updated by the LVGL timer callback using lv_canvas_set_buffer()
-    preview_canvas = lv_canvas_create(preview_parent);
+    // Center horizontally and vertically
+    int img_x = (DISPLAY_WIDTH - display_width_final) / 2;
+    int img_y = STATUS_BAR_HEIGHT + (USEABLE_HEIGHT - display_height_final) / 2;
+    
+    ESP_LOGI(TAG, "Display: %dx%d (useable: %dx%d), PPA output: %dx%d (no rotation), LVGL zoom: %u (scale: %.3f)", 
+             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH, USEABLE_HEIGHT,
+             PPA_OUTPUT_WIDTH, PPA_OUTPUT_HEIGHT, lvgl_zoom, scale);
+    ESP_LOGI(TAG, "Final display size: %dx%d at (%d,%d)", 
+             display_width_final, display_height_final, img_x, img_y);
+    
+    // Create LVGL image widget for camera preview (hardware-accelerated scaling)
+    // Using lv_img instead of lv_canvas allows LVGL to use hardware 2D-DMA for scaling
+    preview_canvas = lv_img_create(preview_parent);
     if (!preview_canvas) {
-        ESP_LOGE(TAG, "Failed to create LVGL canvas");
+        ESP_LOGE(TAG, "Failed to create LVGL image widget");
         return ESP_FAIL;
     }
     
-    // Set canvas size and position
-    lv_obj_set_size(preview_canvas, canvas_width, canvas_height);
-    lv_obj_set_pos(preview_canvas, canvas_x, canvas_y);
+    // Set image position and pivot point (for zoom)
+    lv_obj_set_pos(preview_canvas, img_x, img_y);
+    lv_img_set_pivot(preview_canvas, 0, 0);  // Zoom from top-left corner
+    lv_img_set_zoom(preview_canvas, lvgl_zoom);  // Apply zoom factor
     lv_obj_clear_flag(preview_canvas, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Initialize canvas with scaled_buffer (will be updated by timer)
-    // Note: We don't set the buffer here, the timer will do it
-    
-    ESP_LOGI(TAG, "LVGL canvas created at %dx%d, positioned at (%d,%d)", 
-             canvas_width, canvas_height, canvas_x, canvas_y);
-    ESP_LOGI(TAG, "Canvas buffer will be updated by LVGL timer callback (safe thread context)");
+    ESP_LOGI(TAG, "LVGL image widget created with zoom=%u (%.1f%%), will scale PPA output to fit display", 
+             lvgl_zoom, (float)lvgl_zoom / 256 * 100);
+    ESP_LOGI(TAG, "Image widget positioned at (%d,%d), final size: %dx%d", 
+             img_x, img_y, display_width_final, display_height_final);
     
     return ESP_OK;
 }
@@ -530,6 +603,8 @@ static esp_err_t init_preview_display(void)
  * 
  * This runs in the LVGL thread context (safe to access LVGL objects)
  * The camera task signals when a new frame is ready via frame_ready_for_display flag
+ * 
+ * Uses lv_img widget with direct buffer source for hardware-accelerated scaling
  */
 static void display_update_timer_cb(lv_timer_t *timer)
 {
@@ -549,15 +624,25 @@ static void display_update_timer_cb(lv_timer_t *timer)
     static uint32_t update_count = 0;
     update_count++;
     
-    // Sync scaled buffer cache before LVGL reads it
-    esp_cache_msync(scaled_buffer, scaled_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    // NO cache sync needed here! DMA writes directly to PSRAM, LVGL reads from PSRAM
+    // Cache sync is only needed when CPU writes to PSRAM (not for DMA writes)
     
-    // Update canvas buffer pointer - LVGL will handle the rendering
-    // This is safe because we're in the LVGL thread (timer callback)
-    lv_canvas_set_buffer(preview_canvas, scaled_buffer, 429, 760, LV_COLOR_FORMAT_RGB565);
+    // Create image descriptor for direct buffer access
+    // Camera outputs CAMERA_HRES×CAMERA_VRES (no rotation - testing bandwidth)
+    static lv_image_dsc_t img_dsc;
+    img_dsc.header.w = CAMERA_HRES;
+    img_dsc.header.h = CAMERA_VRES;
+    img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    img_dsc.header.stride = CAMERA_HRES * 2;  // Bytes per row
+    img_dsc.data_size = CAMERA_HRES * CAMERA_VRES * 2;
+    img_dsc.data = (const uint8_t *)scaled_buffer;
+    
+    // Update image source - LVGL will handle scaling via zoom property
+    lv_img_set_src(preview_canvas, &img_dsc);
     
     if (update_count <= 10) {
-        ESP_LOGI(TAG, "Display update #%lu - Canvas buffer updated (using lv_canvas_set_buffer)", update_count);
+        ESP_LOGI(TAG, "Display update #%lu - Image source updated (%dx%d passthrough, LVGL zoom active)", 
+                 update_count, CAMERA_HRES, CAMERA_VRES);
     }
 }
 
@@ -621,17 +706,16 @@ static void preview_task(void *pvParameters)
             }
             last_frame_time_us = frame_time_us;
             
-            // Log first few frames with timing
-            if (frame_count <= 10) {
+            // Log detailed timing analysis for first 10 frames
+            // OPTIMIZATION: Disable verbose logging during frame processing
+            // Logging takes ~200ms per frame and blocks the preview task!
+            // Only log basic info for first 3 frames, then every 30th frame
+            if (frame_count <= 3 || frame_count % 30 == 0) {
                 uint16_t *pixels = (uint16_t *)frame_trans.buffer;
-                ESP_LOGI(TAG, "Frame #%lu received, first pixels: 0x%04x 0x%04x 0x%04x", 
-                        frame_count, pixels[0], pixels[1], pixels[2]);
-                
-                // Log frame interval for first 10 frames
                 if (frame_interval_us > 0) {
                     float fps = 1000000.0f / frame_interval_us;
-                    ESP_LOGI(TAG, "Frame #%lu interval: %lld us (%.1f fps)", 
-                            frame_count, frame_interval_us, fps);
+                    ESP_LOGI(TAG, "Frame #%lu: interval %lld μs (%.1f FPS)", 
+                             frame_count, frame_interval_us, fps);
                 }
             }
             
@@ -649,35 +733,86 @@ static void preview_task(void *pvParameters)
                         frame_count, pixels[0], pixels[mid_idx], pixels[corner_idx]);
             }
             
-            // Scale frame using PPA to fill display (1288x728 → 480x760, no borders)
+            // TESTING: NO ROTATION - Camera physically mounted for portrait
+            // Camera buffer is 1288×728 in memory, but if mounted rotated, 
+            // the visual scene is portrait. Keep buffer dimensions as-is.
+            // PPA: Just pass through (no rotation, no scaling)
+            
             int64_t ppa_start = esp_timer_get_time();
             
+            // ⚠️ TESTING: Skip memcpy to measure ISP timing only ⚠️
+            #define SKIP_MEMCPY_TEST 0
+            
+            #if SKIP_MEMCPY_TEST
+            // Skip memcpy completely - just measure ISP output timing
+            int64_t ppa_end = esp_timer_get_time();
+            
+            // Signal frame ready WITHOUT copying
+            frame_ready_for_display = false;  // Don't display (buffer not copied)
+            
+            if (frame_count <= 10) {
+                ESP_LOGI(TAG, "Frame #%lu - ISP output ready (SKIPPED memcpy test)", 
+                        frame_count);
+                ESP_LOGI(TAG, "                ISP-only time: %lld us", 
+                        ppa_end - ppa_start);
+            }
+            #else
+            // ASYNC PATH: Use AXI GDMA for fast PSRAM-to-PSRAM memcpy (non-blocking)
+            if (scaled_buffer && dma_handle) {
+                // Start DMA transfer (non-blocking, returns immediately ~1-2us)
+                // Callback will signal frame_ready_sem when DMA completes
+                esp_err_t dma_ret = esp_async_memcpy(dma_handle, 
+                                                     scaled_buffer, 
+                                                     frame_trans.buffer, 
+                                                     CAMERA_HRES * CAMERA_VRES * sizeof(uint16_t),
+                                                     dma_done_callback, 
+                                                     frame_ready_sem);  // CRITICAL: Pass semaphore to callback!
+                
+                int64_t ppa_end = esp_timer_get_time();
+                
+                if (dma_ret == ESP_OK) {
+                    // DMA started successfully - it will complete in background
+                    // Callback will set frame_ready_for_display and signal semaphore
+                    
+                    if (frame_count <= 10) {
+                        ESP_LOGI(TAG, "Frame #%lu - DMA started (async, %dx%d)", 
+                                frame_count, CAMERA_HRES, CAMERA_VRES);
+                        ESP_LOGI(TAG, "                DMA start time: %lld us (non-blocking)", 
+                                ppa_end - ppa_start);
+                    }
+                } else {
+                    // Fallback to CPU memcpy if DMA fails to start
+                    ESP_LOGW(TAG, "DMA start failed (%s), falling back to CPU memcpy", esp_err_to_name(dma_ret));
+                    memcpy(scaled_buffer, frame_trans.buffer, 
+                           CAMERA_HRES * CAMERA_VRES * sizeof(uint16_t));
+                    
+                    ppa_end = esp_timer_get_time();
+                    frame_ready_for_display = true;
+                    
+                    // Signal semaphore for CPU fallback path
+                    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                    xSemaphoreGiveFromISR(frame_ready_sem, &xHigherPriorityTaskWoken);
+                    
+                    if (frame_count <= 10) {
+                        ESP_LOGW(TAG, "Frame #%lu - CPU fallback copy (DMA failed)", frame_count);
+                        ESP_LOGI(TAG, "                CPU time: %lld us", ppa_end - ppa_start);
+                    }
+                }
+            }
+            #endif // SKIP_MEMCPY_TEST
+            
+            #if 0  // DISABLED: ORIGINAL PPA PATH (not used for testing)
             if (ppa_client && scaled_buffer) {
-                // Maintain aspect ratio to avoid PPA constraints
-                // Camera: 1288×728 (landscape) → After 90° CW rotation: 728×1288 (portrait)
-                // Target: Fit within 480×760 (useable display area)
-                
-                const int STATUS_BAR_HEIGHT = 40;
-                const int USEABLE_HEIGHT = DISPLAY_HEIGHT - STATUS_BAR_HEIGHT; // 760
-                
-                // After 90° rotation: 728×1288 → Need to fit in 480×760
-                // Calculate scale to fit both dimensions (maintain aspect ratio)
-                float scale_x_ratio = (float)DISPLAY_WIDTH / CAMERA_VRES;    // 480/728 = 0.659
-                float scale_y_ratio = (float)USEABLE_HEIGHT / CAMERA_HRES;   // 760/1288 = 0.590
-                
-                // Use the SMALLER scale to ensure both dimensions fit
-                float scale = (scale_x_ratio < scale_y_ratio) ? scale_x_ratio : scale_y_ratio;  // 0.590
-                
-                // Calculate actual output dimensions (will have borders on one axis)
-                int output_width = (int)(CAMERA_VRES * scale);   // 728 * 0.590 = 429
-                int output_height = (int)(CAMERA_HRES * scale);  // 1288 * 0.590 = 760
+                // Keep actual buffer dimensions (1288×728 as sensor outputs)
+                const int output_width = CAMERA_HRES;   // 1288 (actual buffer width)
+                const int output_height = CAMERA_VRES;  // 728 (actual buffer height)
 
-                // PPA configuration with uniform scaling
+                // PPA configuration: PASSTHROUGH - No rotation, no scaling
                 ppa_srm_oper_config_t srm_config = {
                     .in = {
                         .buffer = frame_trans.buffer,
-                        .pic_w = CAMERA_HRES,  // 1288 (landscape width)
-                        .pic_h = CAMERA_VRES,  // 728 (landscape height)
+                        .pic_w = CAMERA_HRES,  // 1288 (actual sensor width)
+                        .pic_h = CAMERA_VRES,  // 728 (actual sensor height)
                         .block_w = CAMERA_HRES,
                         .block_h = CAMERA_VRES,
                         .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
@@ -685,15 +820,15 @@ static void preview_task(void *pvParameters)
                     .out = {
                         .buffer = scaled_buffer,
                         .buffer_size = scaled_buffer_size,
-                        .pic_w = output_width,      // 429 (maintains aspect ratio)
-                        .pic_h = output_height,     // 760 (fits height exactly)
+                        .pic_w = output_width,      // 1288 (no change)
+                        .pic_h = output_height,     // 728 (no change)
                         .block_offset_x = 0,
                         .block_offset_y = 0,
                         .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
                     },
-                    .rotation_angle = PPA_SRM_ROTATION_ANGLE_90,  // 90° clockwise
-                    .scale_x = scale,  // 0.590 (uniform scaling)
-                    .scale_y = scale,  // 0.590 (uniform scaling)
+                    .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,  // NO rotation
+                    .scale_x = 1.0f,  // No scaling (passthrough)
+                    .scale_y = 1.0f,  // No scaling (passthrough)
                     .mirror_x = false,
                     .mirror_y = false,
                     .rgb_swap = false,
@@ -746,16 +881,17 @@ static void preview_task(void *pvParameters)
                         frame_ready_for_display = true;
                         
                         if (frame_count <= 10) {
-                            ESP_LOGI(TAG, "Frame #%lu - Scaled frame ready for display (PPA: %lld us, Cache: %lld us)", 
-                                    frame_count, ppa_end - ppa_start, cache_end - cache_start);
+                            ESP_LOGI(TAG, "Frame #%lu - Passthrough complete (%dx%d, no rotation)", 
+                                    frame_count, CAMERA_HRES, CAMERA_VRES);
+                            ESP_LOGI(TAG, "                PPA time: %lld us (passthrough), Cache: %lld us", 
+                                    ppa_end - ppa_start, cache_end - cache_start);
                         }
                         
                         // Log PPA timing for first 10 frames
                         if (frame_count <= 10) {
                             int64_t ppa_time_us = ppa_end - ppa_start;
-                            int64_t cache_time_us = cache_end - cache_start;
-                            ESP_LOGI(TAG, "Frame #%lu - PPA: %lld us, Cache: %lld us, scaled to %dx%d (scale=%.3f)", 
-                                    frame_count, ppa_time_us, cache_time_us, output_width, output_height, scale);
+                            ESP_LOGI(TAG, "Frame #%lu - PPA passthrough: %lld us (no rotation), output: %dx%d", 
+                                    frame_count, ppa_time_us, output_width, output_height);
                         }
                     } else {
                         ESP_LOGW(TAG, "PPA timeout waiting for completion");
@@ -764,6 +900,7 @@ static void preview_task(void *pvParameters)
                     ESP_LOGW(TAG, "PPA operation failed: %s", esp_err_to_name(ppa_ret));
                 }
             }
+            #endif  // Disabled PPA path
             
             int64_t processing_end = esp_timer_get_time();
             
@@ -854,20 +991,26 @@ esp_err_t camera_start(void)
         frame_trans.buflen = frame_buffer_size;
     }
     
-    // Allocate scaled buffer for display
+    // Allocate rotated buffer for PPA output (rotation only, no scaling)
+    // After 90° rotation: 1288x728 → 728x1288
+    // LVGL will handle scaling this to fit 480x800 display
     if (!scaled_buffer) {
-        size_t raw_scaled_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * RGB565_BITS_PER_PIXEL / 8;
-        scaled_buffer_size = (raw_scaled_size + 127) & ~127;  // Align to 128 bytes
-        ESP_LOGI(TAG, "Allocating scaled buffer: %zu bytes (raw: %zu)", scaled_buffer_size, raw_scaled_size);
+        // Camera outputs CAMERA_HRES×CAMERA_VRES, keep as-is (no rotation)
+        const uint32_t buffer_width = CAMERA_HRES;
+        const uint32_t buffer_height = CAMERA_VRES;
+        size_t raw_buffer_size = buffer_width * buffer_height * RGB565_BITS_PER_PIXEL / 8;
+        scaled_buffer_size = (raw_buffer_size + 127) & ~127;  // Align to 128 bytes
+        ESP_LOGI(TAG, "Allocating passthrough buffer (no PPA rotation): %zu bytes (%lux%lu)", 
+                 scaled_buffer_size, buffer_width, buffer_height);
         
         scaled_buffer = heap_caps_aligned_calloc(128, 1, scaled_buffer_size, 
                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!scaled_buffer) {
-            ESP_LOGE(TAG, "Failed to allocate scaled buffer");
+            ESP_LOGE(TAG, "Failed to allocate passthrough buffer");
             return ESP_ERR_NO_MEM;
         }
         
-        ESP_LOGI(TAG, "Scaled buffer allocated in PSRAM");
+        ESP_LOGI(TAG, "Passthrough buffer allocated in PSRAM (testing 2-lane bandwidth, LVGL will scale)");
         memset(scaled_buffer, 0xFF, scaled_buffer_size);
         esp_cache_msync(scaled_buffer, scaled_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
     }
@@ -875,6 +1018,29 @@ esp_err_t camera_start(void)
     // Initialize PPA if not done
     if (!ppa_client) {
         ESP_RETURN_ON_ERROR(init_ppa(), TAG, "PPA initialization failed");
+    }
+    
+    // Initialize DMA for fast PSRAM memcpy (truly async - no blocking)
+    if (!dma_handle) {
+        ESP_LOGI(TAG, "Initializing AXI GDMA for async PSRAM memcpy...");
+        
+        async_memcpy_config_t dma_config = {
+            .backlog = 4,  // Queue up to 4 pending transfers
+            .sram_trans_align = 4,  // 4-byte alignment for SRAM
+            .psram_trans_align = 64,  // 64-byte alignment for PSRAM (optimal for cache)
+            .dma_burst_size = 64,  // 64-byte bursts for PSRAM efficiency
+            .flags = 0
+        };
+        
+        // ESP32-P4 has AXI GDMA which can access PSRAM efficiently
+        // Note: Default install() uses AHB GDMA which doesn't support PSRAM!
+        ret = esp_async_memcpy_install_gdma_axi(&dma_config, &dma_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initialize AXI GDMA: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        
+        ESP_LOGI(TAG, "AXI GDMA initialized (async, non-blocking, expected ~35ms per 4MB frame)");
     }
     
     // Create semaphore for frame ready notifications
@@ -1001,7 +1167,7 @@ esp_err_t camera_start(void)
     // Initialize camera controller
     ESP_RETURN_ON_ERROR(init_camera_controller(), TAG, "Camera controller init failed");
     
-    // Initialize ISP processor
+    // Initialize ISP processor (MANDATORY - ESP32-P4 requires ISP in pipeline)
     ESP_RETURN_ON_ERROR(init_isp_processor(), TAG, "ISP processor init failed");
     
     // Initialize LVGL display
@@ -1034,10 +1200,10 @@ esp_err_t camera_start(void)
     }
     
     // Create LVGL timer to update display (runs in LVGL thread context)
-    // This safely handles canvas updates without cross-thread LVGL access
-    // Set to ~13 FPS (77ms) to match PPA throughput and avoid frame queue buildup
+    // This safely handles image source updates without cross-thread LVGL access
+    // Set to 30 FPS (33ms) - PPA rotation-only should easily handle this
     bsp_display_lock(0);
-    update_timer = lv_timer_create(display_update_timer_cb, 77, NULL);  // ~13 FPS (matches PPA speed)
+    update_timer = lv_timer_create(display_update_timer_cb, 33, NULL);  // 30 FPS target
     if (!update_timer) {
         ESP_LOGE(TAG, "Failed to create display update timer");
         bsp_display_unlock();
@@ -1048,7 +1214,7 @@ esp_err_t camera_start(void)
     }
     bsp_display_unlock();
     
-    ESP_LOGI(TAG, "Display update timer created (77ms interval, ~13 FPS to match PPA)");
+    ESP_LOGI(TAG, "Display update timer created (33ms interval, 30 FPS target)");
     
     // Note: Task will call esp_cam_ctlr_receive() in its loop (like the example)
     ESP_LOGI(TAG, "Camera started successfully");
