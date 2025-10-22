@@ -59,6 +59,8 @@
 #include "camera_dma.h"
 #include "camera_ppa.h"
 #include "camera_isp.h"
+#include "camera_sensor.h"
+#include "camera_controller.h"
 
 static const char *TAG = "camera";
 
@@ -140,154 +142,7 @@ uint32_t ppa_callback_count = 0;
 uint32_t semaphore_overflow_count = 0;
 uint32_t lvgl_lock_timeout_count = 0;
 
-// Forward declarations
-static esp_err_t init_camera_controller(void);
 
-/**
- * Camera callback: Provide new buffer for next frame
- * 
- * This callback is called by the camera controller to get a buffer for the next frame.
- * We provide our pre-allocated frame buffer which the ISP will write into.
- */
-static bool camera_get_new_vb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data)
-{
-    // Dereference to copy the structure by value (matching reference example)
-    esp_cam_ctlr_trans_t new_trans = *(esp_cam_ctlr_trans_t *)user_data;
-    trans->buffer = new_trans.buffer;
-    trans->buflen = new_trans.buflen;
-
-    // Return true to indicate we successfully provided a buffer
-    // Returning false would tell the driver we couldn't provide a buffer,
-    // which could cause it to stop requesting frames!
-    return true;
-}
-
-/**
- * Camera callback: Frame reception finished
- * 
- * This callback is fired by the camera controller when a frame is ready.
- * We signal the preview task and return true to release the buffer back to the driver.
- * 
- * Frame skipping: Camera captures at 30 FPS but PPA can only process at 13 FPS.
- * To prevent queue buildup, we skip frames (process every 2nd frame = ~15 FPS target).
- */
-static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data)
-{
-    BaseType_t high_task_woken = pdFALSE;
-    
-    static uint32_t callback_count = 0;
-    callback_count++;
-    
-    // Use system tick count (safe in ISR) - will measure in task
-    last_callback_time = xTaskGetTickCountFromISR();
-    
-    // NO FRAME SKIPPING: With PPA rotation-only (~5-10ms), should handle all 30 FPS
-    // Log first 20 frames, then every 30th to monitor performance
-    if (callback_count <= 20 || callback_count % 30 == 0) {
-        ESP_EARLY_LOGI(TAG, "Frame callback #%lu (processing all frames, PPA rotation-only)", callback_count);
-    }
-    
-    // Signal the preview task that a new frame is ready for processing
-    BaseType_t result = pdFAIL;
-    if (frame_ready_sem) {
-        result = xSemaphoreGiveFromISR(frame_ready_sem, &high_task_woken);
-        
-        // Track semaphore overflow (semaphore full, frame dropped)
-        if (result == pdFAIL) {
-            semaphore_overflow_count++;
-            if (semaphore_overflow_count % 10 == 0) {
-                ESP_EARLY_LOGW(TAG, "⚠️ Frame semaphore FULL! Dropped %lu frames total", semaphore_overflow_count);
-            }
-        }
-    }
-    
-    // IMPORTANT: Return true to release buffer back to camera controller
-    // The ISP outputs to our pre-allocated buffer, so the trans buffer is just metadata
-    // and can be reused immediately. Returning false would block the driver!
-    return true;
-}
-
-/**
- * Initialize CSI camera controller
- */
-static esp_err_t init_camera_controller(void)
-{
-    ESP_LOGI(TAG, "Initializing CSI camera controller...");
-    
-    esp_cam_ctlr_csi_config_t csi_config = {
-        .ctlr_id = 0,
-        .h_res = CAMERA_HRES,
-        .v_res = CAMERA_VRES,
-        .lane_bit_rate_mbps = CAMERA_LANE_BITRATE_MBPS,
-        .input_data_color_type = CAM_CTLR_COLOR_RAW10,  // OV02C10 outputs RAW10
-        .output_data_color_type = CAM_CTLR_COLOR_RGB565,  // ISP converts RAW10 → RGB565
-        .data_lane_num = CAMERA_DATA_LANES,
-        .byte_swap_en = false,
-        .queue_items = 2,  // INCREASED: Test if buffer queue depth affects frame rate
-    };
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // 🔍 DETAILED CSI/ISP TIMING DIAGNOSTICS
-    // ═══════════════════════════════════════════════════════════════════════════
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║           CSI CONTROLLER CONFIGURATION                       ║");
-    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════════╝");
-    ESP_LOGI(TAG, "  Resolution:        %d × %d pixels", CAMERA_HRES, CAMERA_VRES);
-    ESP_LOGI(TAG, "  Frame size:        %d bytes (RGB565)", CAMERA_HRES * CAMERA_VRES * 2);
-    ESP_LOGI(TAG, "  Data lanes:        %d", CAMERA_DATA_LANES);
-    ESP_LOGI(TAG, "  Lane bit rate:     %d Mbps per lane", CAMERA_LANE_BITRATE_MBPS);
-    ESP_LOGI(TAG, "  Total bandwidth:   %d Mbps (%d lanes × %d Mbps)", 
-             CAMERA_LANE_BITRATE_MBPS * CAMERA_DATA_LANES, 
-             CAMERA_DATA_LANES, 
-             CAMERA_LANE_BITRATE_MBPS);
-    ESP_LOGI(TAG, "  Input format:      RAW10 (10 bits per pixel)");
-    ESP_LOGI(TAG, "  Output format:     RGB565 (16 bits per pixel, ISP Demosaic)");
-    ESP_LOGI(TAG, "");
-    
-    // Calculate expected frame delivery time
-    uint32_t raw10_frame_bits = CAMERA_HRES * CAMERA_VRES * 10;  // 10 bits per pixel
-    uint32_t total_bandwidth_bps = (uint64_t)CAMERA_LANE_BITRATE_MBPS * CAMERA_DATA_LANES * 1000000ULL;
-    uint32_t expected_frame_time_us = ((uint64_t)raw10_frame_bits * 1000000ULL) / total_bandwidth_bps;
-    float expected_fps = 1000000.0f / expected_frame_time_us;
-    
-    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║           THEORETICAL PERFORMANCE                            ║");
-    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════════╝");
-    ESP_LOGI(TAG, "  RAW10 frame size:  %d bits", raw10_frame_bits);
-    ESP_LOGI(TAG, "  Expected transfer: %d μs per frame", expected_frame_time_us);
-    ESP_LOGI(TAG, "  Expected FPS:      %.1f FPS (MIPI bandwidth only)", expected_fps);
-    ESP_LOGI(TAG, "  Sensor configured: ~27 FPS (HTS=2280, VTS=1164, 81.67MHz)");
-    ESP_LOGI(TAG, "  ⚠️  ACTUAL FPS:    ~8.3 FPS (120ms intervals) ← MYSTERY!");
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "  🎯 Goal: Find where the 120ms frame interval comes from");
-    ESP_LOGI(TAG, "");
-    
-    ESP_RETURN_ON_ERROR(
-        esp_cam_new_csi_ctlr(&csi_config, &cam_handle),
-        TAG, "Failed to create CSI controller"
-    );
-    
-    // Register callbacks
-    esp_cam_ctlr_evt_cbs_t cbs = {
-        .on_get_new_trans = camera_get_new_vb,
-        .on_trans_finished = camera_trans_finished,
-    };
-    
-    ESP_RETURN_ON_ERROR(
-        esp_cam_ctlr_register_event_callbacks(cam_handle, &cbs, &frame_trans),
-        TAG, "Failed to register camera callbacks"
-    );
-    
-    ESP_RETURN_ON_ERROR(
-        esp_cam_ctlr_enable(cam_handle),
-        TAG, "Failed to enable camera controller"
-    );
-    
-    ESP_LOGI(TAG, "CSI camera controller initialized");
-    
-    return ESP_OK;
-}
 
 /**
  * Initialize ISP processor - NOW IMPLEMENTED IN camera_isp.c
@@ -484,7 +339,6 @@ static void preview_task(void *pvParameters)
             // Logging takes ~200ms per frame and blocks the preview task!
             // Only log basic info for first 3 frames, then every 30th frame
             if (frame_count <= 3 || frame_count % 30 == 0) {
-                uint16_t *pixels = (uint16_t *)frame_trans.buffer;
                 if (frame_interval_us > 0) {
                     float fps = 1000000.0f / frame_interval_us;
                     ESP_LOGI(TAG, "Frame #%lu: interval %lld μs (%.1f FPS)", 
@@ -715,8 +569,6 @@ static void preview_task(void *pvParameters)
  */
 esp_err_t camera_start(void)
 {
-    esp_err_t ret;
-    
     if (preview_running) {
         ESP_LOGW(TAG, "Camera already running");
         return ESP_OK;
@@ -808,128 +660,23 @@ esp_err_t camera_start(void)
     
     // Initialize camera sensor if not done
     if (!cam_sensor) {
-        ESP_LOGI(TAG, "Initializing OV02C10 camera sensor...");
-        
-        // Create SCCB I2C handle for sensor communication
-        esp_sccb_io_handle_t sccb_io_handle = NULL;
-        sccb_i2c_config_t i2c_config = {
-            .scl_speed_hz = 100000,  // 100kHz for SCCB
-            .device_address = OV02C10_SCCB_ADDR,
-            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        };
-        ret = sccb_new_i2c_io(i2c_bus, &i2c_config, &sccb_io_handle);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to create SCCB I2C handle: %s", esp_err_to_name(ret));
-            return ret;
-        }
-        
-        // Configure and detect OV02C10 sensor
-        esp_cam_sensor_config_t sensor_config = {
-            .sccb_handle = sccb_io_handle,
-            .reset_pin = -1,  // Reset handled by BSP
-            .pwdn_pin = -1,   // Power down handled by BSP
-            .xclk_pin = -1,   // XCLK not used (sensor has internal clock)
-            .xclk_freq_hz = 0,
-            .sensor_port = ESP_CAM_SENSOR_MIPI_CSI,
-        };
-        
-        cam_sensor = ov02c10_detect(&sensor_config);
-        if (!cam_sensor) {
-            ESP_LOGE(TAG, "Failed to detect OV02C10 sensor");
-            return ESP_FAIL;
-        }
-        
-        ESP_LOGI(TAG, "OV02C10 sensor detected successfully");
-        
-        // Configure sensor for target resolution
-        esp_cam_sensor_format_array_t formats;
-        cam_sensor->ops->query_support_formats(cam_sensor, &formats);
-        
-        // Log all available formats
-        ESP_LOGI(TAG, "Sensor supports %d formats:", formats.count);
-        for (uint32_t i = 0; i < formats.count; i++) {
-            ESP_LOGI(TAG, "  [%d] %s: %dx%d @ %d fps", 
-                    i, 
-                    formats.format_array[i].name,
-                    formats.format_array[i].width, 
-                    formats.format_array[i].height, 
-                    formats.format_array[i].fps);
-        }
-        
-        // Find matching format (resolution and lane count)
-        const esp_cam_sensor_format_t *target_format = NULL;
-        const char *lane_keyword = (CAMERA_DATA_LANES == 2) ? "2lane" : "1lane";
-        
-        for (uint32_t i = 0; i < formats.count; i++) {
-            if (formats.format_array[i].width == CAMERA_HRES &&
-                formats.format_array[i].height == CAMERA_VRES) {
-                // Check if lane count matches
-                if (strstr(formats.format_array[i].name, lane_keyword)) {
-                    target_format = &formats.format_array[i];
-                    ESP_LOGI(TAG, "Selected format: %s (%dx%d @ %d fps)",
-                            target_format->name,
-                            target_format->width, target_format->height, target_format->fps);
-                    break;
-                } else if (!target_format) {
-                    // Fallback to first matching resolution if no lane-specific format found
-                    target_format = &formats.format_array[i];
-                }
-            }
-        }
-        
-        if (target_format && !strstr(target_format->name, lane_keyword)) {
-            ESP_LOGW(TAG, "Could not find %s format, using: %s", lane_keyword, target_format->name);
-        }
-        
-        if (!target_format) {
-            ESP_LOGE(TAG, "Sensor does not support %dx%d resolution", CAMERA_HRES, CAMERA_VRES);
-            return ESP_ERR_NOT_SUPPORTED;
-        }
-        
-        // Set the format
-        ret = cam_sensor->ops->set_format(cam_sensor, target_format);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to set sensor format: %s", esp_err_to_name(ret));
-            return ret;
-        }
-        ESP_LOGI(TAG, "Sensor format set successfully");
-        
-        // CRITICAL: Stop sensor streaming if it's already running (first boot scenario)
-        // On first boot, sensor hardware may be in unknown state (powered on by bootloader
-        // or residual state from previous power cycle). Explicitly stop to ensure clean state.
-        int stream_off = 0;
-        ret = cam_sensor->ops->priv_ioctl(cam_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_off);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Sensor stream stopped (ensuring clean state on first init)");
-        } else {
-            ESP_LOGW(TAG, "Sensor stream stop returned: %s (may already be stopped)", esp_err_to_name(ret));
-        }
+        ESP_RETURN_ON_ERROR(camera_sensor_init(), TAG, "Camera sensor init failed");
     }
     
-    // Start sensor streaming (MUST be outside the init block to support restart)
-    // This ensures the stream is started on every camera_start(), not just first init
-    int stream_on = 1;
-    ret = cam_sensor->ops->priv_ioctl(cam_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_on);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start sensor streaming: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "Sensor stream started");
+    // Start sensor streaming
+    ESP_RETURN_ON_ERROR(camera_sensor_start_stream(), TAG, "Failed to start sensor streaming");
     
     // Initialize camera controller
-    ESP_RETURN_ON_ERROR(init_camera_controller(), TAG, "Camera controller init failed");
+    ESP_RETURN_ON_ERROR(camera_controller_init(), TAG, "Camera controller init failed");
+    
+    // Start camera controller
+    ESP_RETURN_ON_ERROR(camera_controller_start(), TAG, "Camera controller start failed");
     
     // Initialize ISP processor (MANDATORY - ESP32-P4 requires ISP in pipeline)
     ESP_RETURN_ON_ERROR(init_isp_processor(), TAG, "ISP processor init failed");
     
     // Initialize LVGL display
     ESP_RETURN_ON_ERROR(init_preview_display(), TAG, "Preview display init failed");
-    
-    // Start camera controller streaming (MUST be before starting task)
-    ESP_RETURN_ON_ERROR(
-        esp_cam_ctlr_start(cam_handle),
-        TAG, "Failed to start camera controller"
-    );
     
     ESP_LOGI(TAG, "Camera controller started, creating preview task");
     
@@ -947,7 +694,7 @@ esp_err_t camera_start(void)
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create preview task");
         preview_running = false;
-        esp_cam_ctlr_stop(cam_handle);
+        camera_controller_stop();
         return ESP_FAIL;
     }
     
@@ -960,7 +707,7 @@ esp_err_t camera_start(void)
         ESP_LOGE(TAG, "Failed to create display update timer");
         bsp_display_unlock();
         preview_running = false;
-        esp_cam_ctlr_stop(cam_handle);
+        camera_controller_stop();
         vTaskDelete(preview_task_handle);
         return ESP_FAIL;
     }
@@ -984,20 +731,14 @@ esp_err_t camera_stop(void)
     
     ESP_LOGI(TAG, "Stopping camera...");
     
-    // Stop sensor streaming FIRST (critical for clean restart)
+    // Stop sensor stream
     if (cam_sensor) {
-        int stream_off = 0;
-        esp_err_t ret = cam_sensor->ops->priv_ioctl(cam_sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_off);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Sensor stream stopped");
-        } else {
-            ESP_LOGW(TAG, "Failed to stop sensor stream: %s", esp_err_to_name(ret));
-        }
+        camera_sensor_stop_stream();
     }
     
     // Stop camera controller
     if (cam_handle) {
-        esp_cam_ctlr_stop(cam_handle);
+        camera_controller_stop();
     }
     
     // Delete LVGL update timer

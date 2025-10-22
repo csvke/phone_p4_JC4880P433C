@@ -87,7 +87,8 @@ esp_err_t camera_dma_transfer(void *dst, const void *src, size_t size)
     
     // Launch async memcpy (non-blocking)
     // Callback will fire when complete
-    esp_err_t ret = esp_async_memcpy(dma_handle, dst, src, size, 
+    // Cast away const - esp_async_memcpy doesn't modify src but API doesn't use const
+    esp_err_t ret = esp_async_memcpy(dma_handle, dst, (void *)src, size, 
                                      dma_done_callback, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Async memcpy failed: %s", esp_err_to_name(ret));
