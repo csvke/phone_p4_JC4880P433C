@@ -1,4 +1,7 @@
 idf_component_register(SRCS "src/camera.c"
+                              "src/camera_dma.c"
+                              "src/camera_ppa.c"
+                              "src/camera_isp.c"
                               "src/CameraApp.cpp"
                               "ui/ui.c"
                               "assets/camera_app_icon.c"

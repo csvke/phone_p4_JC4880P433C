@@ -55,6 +55,10 @@
 
 // Local includes
 #include "camera.h"
+#include "camera_internal.h"
+#include "camera_dma.h"
+#include "camera_ppa.h"
+#include "camera_isp.h"
 
 static const char *TAG = "camera";
 
@@ -85,79 +89,59 @@ static const char *TAG = "camera";
 // ISP clock (80MHz is recommended for ESP32-P4)
 #define ISP_CLK_HZ (80 * 1000 * 1000)
 
-// Global state
-static bool camera_initialized = false;
-static bool preview_running = false;
-static SemaphoreHandle_t frame_ready_sem = NULL;
+// ═══════════════════════════════════════════════════════════════════════════
+// Global state variables (declared in camera_internal.h)
+// ═══════════════════════════════════════════════════════════════════════════
 
-// Camera Controller and ISP handles
-static esp_cam_ctlr_handle_t cam_handle = NULL;
-static isp_proc_handle_t isp_proc = NULL;
-static isp_awb_ctlr_t awb_ctrl = NULL;
-static i2c_master_bus_handle_t i2c_bus = NULL;
-static esp_cam_sensor_device_t *cam_sensor = NULL;
+// Initialization flags
+bool camera_initialized = false;
+bool preview_running = false;
 
-// PPA (Pixel Processing Accelerator) for scaling
-static ppa_client_handle_t ppa_client = NULL;
-static SemaphoreHandle_t ppa_done_sem = NULL;
+// Hardware handles
+esp_cam_ctlr_handle_t cam_handle = NULL;
+isp_proc_handle_t isp_proc = NULL;
+isp_awb_ctlr_t awb_ctrl = NULL;
+i2c_master_bus_handle_t i2c_bus = NULL;
+esp_cam_sensor_device_t *cam_sensor = NULL;
+ppa_client_handle_t ppa_client = NULL;
+async_memcpy_handle_t dma_handle = NULL;
 
-// DMA for fast PSRAM memcpy (replaces slow CPU memcpy)
-// Uses async callback - no separate semaphore needed
-static async_memcpy_handle_t dma_handle = NULL;
-
-// Forward declarations
-static esp_err_t init_isp_processor(void);
+// Synchronization primitives
+SemaphoreHandle_t frame_ready_sem = NULL;
+SemaphoreHandle_t ppa_done_sem = NULL;
 
 // LVGL display objects
-static lv_obj_t *preview_parent = NULL;
-static lv_obj_t *preview_canvas = NULL;
-static lv_display_t *display = NULL;
-static lv_timer_t *update_timer = NULL;
+lv_obj_t *preview_parent = NULL;
+lv_obj_t *preview_canvas = NULL;
+lv_display_t *display = NULL;
+lv_timer_t *update_timer = NULL;
 
 // Frame buffers
-static void *frame_buffer = NULL;       // Camera output buffer (1288x728)
-static size_t frame_buffer_size = 0;
-static void *scaled_buffer = NULL;      // Scaled buffer for display (480x800)
-static size_t scaled_buffer_size = 0;
+void *frame_buffer = NULL;       // Camera output buffer (1288x728)
+size_t frame_buffer_size = 0;
+void *scaled_buffer = NULL;      // Scaled buffer for display (480x800)
+size_t scaled_buffer_size = 0;
 
 // Flag to indicate new frame is ready for display
-static volatile bool frame_ready_for_display = false;
+volatile bool frame_ready_for_display = false;
 
 // Camera transaction descriptor
-static esp_cam_ctlr_trans_t frame_trans = {0};
+esp_cam_ctlr_trans_t frame_trans = {0};
 
 // Task handle for frame reception
-static TaskHandle_t preview_task_handle = NULL;
+TaskHandle_t preview_task_handle = NULL;
 
 // Timing measurement variables (use TickType_t for ISR-safe timing)
-static TickType_t last_callback_time = 0;
-static int64_t last_frame_time_us = 0;
+TickType_t last_callback_time = 0;
+int64_t last_frame_time_us = 0;
 
 // Diagnostic counters for debugging freeze issue
-static uint32_t ppa_callback_count = 0;
-static uint32_t semaphore_overflow_count = 0;
-static uint32_t lvgl_lock_timeout_count = 0;
+uint32_t ppa_callback_count = 0;
+uint32_t semaphore_overflow_count = 0;
+uint32_t lvgl_lock_timeout_count = 0;
 
-/**
- * DMA callback: Called when async memcpy completes
- * Runs in ISR context - must be fast and use ISR-safe functions only
- * 
- * This signals that the frame is ready for display after DMA completes.
- */
-static bool IRAM_ATTR dma_done_callback(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args)
-{
-    // Mark frame as ready for display (DMA completed successfully)
-    // The LVGL timer will poll this flag and update the display
-    frame_ready_for_display = true;
-    
-    // DO NOT signal frame_ready_sem here! That semaphore is for camera frames only.
-    // The camera ISR signals when a new frame is captured (camera_trans_finished).
-    // The preview task processes camera frames immediately (launches DMA).
-    // The LVGL timer polls frame_ready_for_display to update display when DMA completes.
-    
-    // No need to wake any task - LVGL timer runs independently
-    return false;  // No higher priority task woken
-}
+// Forward declarations
+static esp_err_t init_camera_controller(void);
 
 /**
  * Camera callback: Provide new buffer for next frame
@@ -221,71 +205,6 @@ static bool camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_tra
     // The ISP outputs to our pre-allocated buffer, so the trans buffer is just metadata
     // and can be reused immediately. Returning false would block the driver!
     return true;
-}
-
-/**
- * PPA callback: Called when scaling operation completes
- */
-static bool ppa_transaction_done_cb(ppa_client_handle_t ppa_client, 
-                                   ppa_event_data_t *event_data, void *user_data)
-{
-    BaseType_t high_task_woken = pdFALSE;
-    
-    // Track PPA callback count (separate from camera callbacks)
-    ppa_callback_count++;
-    
-    // Signal that PPA scaling is complete
-    if (ppa_done_sem) {
-        xSemaphoreGiveFromISR(ppa_done_sem, &high_task_woken);
-        // Log every 10th callback to avoid spam
-        if (ppa_callback_count <= 10 || ppa_callback_count % 10 == 0) {
-            ESP_EARLY_LOGI(TAG, "PPA callback #%lu fired, semaphore signaled", ppa_callback_count);
-        }
-    } else {
-        ESP_EARLY_LOGE(TAG, "PPA callback fired but semaphore is NULL!");
-    }
-    
-    return high_task_woken == pdTRUE;
-}
-
-/**
- * Initialize PPA (Pixel Processing Accelerator) for scaling
- */
-static esp_err_t init_ppa(void)
-{
-    ESP_LOGI(TAG, "Initializing PPA for scaling %dx%d → %dx%d...", 
-             CAMERA_HRES, CAMERA_VRES, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    
-    // Register PPA client for Scale-Rotate-Mirror (SRM) operation
-    ppa_client_config_t ppa_config = {
-        .oper_type = PPA_OPERATION_SRM,  // Scale-Rotate-Mirror
-        .max_pending_trans_num = 1,
-    };
-    
-    ESP_RETURN_ON_ERROR(
-        ppa_register_client(&ppa_config, &ppa_client),
-        TAG, "Failed to register PPA client"
-    );
-    
-    // Register PPA callback
-    ppa_event_callbacks_t ppa_cbs = {
-        .on_trans_done = ppa_transaction_done_cb,
-    };
-    
-    ESP_RETURN_ON_ERROR(
-        ppa_client_register_event_callbacks(ppa_client, &ppa_cbs),
-        TAG, "Failed to register PPA callbacks"
-    );
-    
-    // Create semaphore for PPA completion
-    ppa_done_sem = xSemaphoreCreateBinary();
-    if (!ppa_done_sem) {
-        ESP_LOGE(TAG, "Failed to create PPA semaphore");
-        return ESP_ERR_NO_MEM;
-    }
-    
-    ESP_LOGI(TAG, "PPA initialized successfully");
-    return ESP_OK;
 }
 
 /**
@@ -371,155 +290,12 @@ static esp_err_t init_camera_controller(void)
 }
 
 /**
- * Initialize ISP processor
+ * Initialize ISP processor - NOW IMPLEMENTED IN camera_isp.c
+ * This wrapper kept for legacy compatibility during refactoring
  */
 static esp_err_t init_isp_processor(void)
 {
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║           ISP PROCESSOR CONFIGURATION                        ║");
-    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════════╝");
-    
-    esp_isp_processor_cfg_t isp_config = {
-        .clk_hz = ISP_CLK_HZ,
-        .input_data_source = ISP_INPUT_DATA_SOURCE_CSI,
-        .input_data_color_type = ISP_COLOR_RAW10,  // OV02C10 outputs RAW10
-        .output_data_color_type = ISP_COLOR_RGB565,
-        .has_line_start_packet = false,
-        .has_line_end_packet = false,
-        .h_res = CAMERA_HRES,
-        .v_res = CAMERA_VRES,
-    };
-    
-    ESP_LOGI(TAG, "  ISP Clock:         %d Hz (%.1f MHz)", ISP_CLK_HZ, ISP_CLK_HZ / 1000000.0f);
-    ESP_LOGI(TAG, "  Input:             RAW10 (10-bit Bayer from sensor)");
-    ESP_LOGI(TAG, "  Output:            RGB565 (16-bit after Demosaic)");
-    ESP_LOGI(TAG, "  Resolution:        %d × %d", CAMERA_HRES, CAMERA_VRES);
-    ESP_LOGI(TAG, "  Processing:        Demosaic, AWB, Color Correction, Sharpen");
-    ESP_LOGI(TAG, "");
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_new_processor(&isp_config, &isp_proc),
-        TAG, "Failed to create ISP processor"
-    );
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_enable(isp_proc),
-        TAG, "Failed to enable ISP processor"
-    );
-    
-    // Configure Demosaic module for RAW10 → RGB conversion (Bayer demosaicing)
-    esp_isp_demosaic_config_t demosaic_config = {
-        .grad_ratio = {
-            .integer = 2,  // Gradient ratio integer part (0-3 valid range)
-            .decimal = 0,
-        },
-        .padding_mode = ISP_DEMOSAIC_EDGE_PADDING_MODE_SRND_DATA,
-        .padding_data = 0x00,
-        .padding_line_tail_valid_start_pixel = 0,
-        .padding_line_tail_valid_end_pixel = 0,
-    };
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_demosaic_configure(isp_proc, &demosaic_config),
-        TAG, "Failed to configure Demosaic"
-    );
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_demosaic_enable(isp_proc),
-        TAG, "Failed to enable Demosaic (RAW to RGB conversion)"
-    );
-    
-    ESP_LOGI(TAG, "ISP Demosaic module enabled (RAW10 → RGB conversion)");
-    
-    // Configure Color Correction Matrix (CCM) to fix purple tint
-    // Identity matrix baseline with adjustments to reduce blue/purple cast
-    esp_isp_ccm_config_t ccm_config = {
-        .matrix = {
-            {1.0,  0.0,  0.0},   // Red channel: pass through
-            {0.0,  1.0,  0.0},   // Green channel: pass through
-            {0.0,  0.0,  0.75}   // Blue channel: reduce by 15% to counteract purple tint
-        },
-        .saturation = true
-    };
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_ccm_configure(isp_proc, &ccm_config),
-        TAG, "Failed to configure CCM"
-    );
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_ccm_enable(isp_proc),
-        TAG, "Failed to enable CCM"
-    );
-    
-    // Configure Automatic White Balance (AWB)
-    // Sample after CCM since we're applying CCM corrections
-    esp_isp_awb_config_t awb_config = {
-        .sample_point = ISP_AWB_SAMPLE_POINT_AFTER_CCM,  // Sample after CCM correction
-        .window = {
-            .top_left = {
-                .x = CAMERA_HRES / 6,      // Start 1/6 from left
-                .y = CAMERA_VRES / 6       // Start 1/6 from top
-            },
-            .btm_right = {
-                .x = CAMERA_HRES * 5 / 6,  // End 5/6 from left (middle 2/3)
-                .y = CAMERA_VRES * 5 / 6   // End 5/6 from top (middle 2/3)
-            }
-        },
-        .white_patch = {
-            .luminance = {
-                .min = 0,       // Allow low light operation
-                .max = 220 * 3  // Exclude overexposed pixels (not 255*3)
-            },
-            .red_green_ratio = {
-                .min = 0.0,
-                .max = 3.999    // Wide range to catch all color casts
-            },
-            .blue_green_ratio = {
-                .min = 0.0,
-                .max = 3.999    // Wide range to catch all color casts
-            }
-        },
-        .intr_priority = 0  // Let driver choose priority
-    };
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_new_awb_controller(isp_proc, &awb_config, &awb_ctrl),
-        TAG, "Failed to create AWB controller"
-    );
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_awb_controller_enable(awb_ctrl),
-        TAG, "Failed to enable AWB controller"
-    );
-    
-    // Configure Color Adjustments (brightness, saturation, contrast, hue)
-    esp_isp_color_config_t color_config = {
-        .color_contrast = {
-            .integer = 1,
-            .decimal = 0        // Contrast: 1.0 (normal, range 0-1.0)
-        },
-        .color_saturation = {
-            .integer = 1,
-            .decimal = 0        // Saturation: 1.0 (normal, range 0-1.0)
-        },
-        .color_hue = 0,         // Hue: 0 degrees (no shift, range 0-360)
-        .color_brightness = 0   // Brightness: 0 (normal, range -128 to +127)
-    };
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_color_configure(isp_proc, &color_config),
-        TAG, "Failed to configure color adjustments"
-    );
-    
-    ESP_RETURN_ON_ERROR(
-        esp_isp_color_enable(isp_proc),
-        TAG, "Failed to enable color adjustments"
-    );
-    
-    ESP_LOGI(TAG, "ISP processor initialized with Demosaic, CCM, AWB, and color adjustments");
-    return ESP_OK;
+    return camera_isp_init();
 }
 
 /**
@@ -541,13 +317,10 @@ static esp_err_t init_preview_display(void)
     }
     
     // Get display size (Brookesia may return useable area, not full display)
-    int32_t display_width = lv_display_get_horizontal_resolution(display);
-    int32_t display_height = lv_display_get_vertical_resolution(display);
-    
-    // Use actual display constants for calculations
+    // Use display constants from camera_internal.h
     // DISPLAY_WIDTH = 480, DISPLAY_HEIGHT = 800 (full display including status bar)
-    const int STATUS_BAR_HEIGHT = 40;
-    const int USEABLE_HEIGHT = DISPLAY_HEIGHT - STATUS_BAR_HEIGHT; // 800 - 40 = 760
+    // STATUS_BAR_HEIGHT = 40 (defined in camera_internal.h)
+    const int useable_height = DISPLAY_HEIGHT - STATUS_BAR_HEIGHT; // 800 - 40 = 760
     
     // Camera outputs CAMERA_HRES×CAMERA_VRES (no rotation, landscape)
     // We need to scale this to fit within 480x760 useable area
@@ -556,7 +329,7 @@ static esp_err_t init_preview_display(void)
     const int PPA_OUTPUT_HEIGHT = CAMERA_VRES;
     
     float scale_x = (float)DISPLAY_WIDTH / PPA_OUTPUT_WIDTH;
-    float scale_y = (float)USEABLE_HEIGHT / PPA_OUTPUT_HEIGHT;
+    float scale_y = (float)useable_height / PPA_OUTPUT_HEIGHT;
     float scale = (scale_x < scale_y) ? scale_x : scale_y;  // Use smaller to fit both
     
     // Convert to LVGL zoom (256 = 100%)
@@ -568,10 +341,10 @@ static esp_err_t init_preview_display(void)
     
     // Center horizontally and vertically
     int img_x = (DISPLAY_WIDTH - display_width_final) / 2;
-    int img_y = STATUS_BAR_HEIGHT + (USEABLE_HEIGHT - display_height_final) / 2;
+    int img_y = STATUS_BAR_HEIGHT + (useable_height - display_height_final) / 2;
     
     ESP_LOGI(TAG, "Display: %dx%d (useable: %dx%d), PPA output: %dx%d (no rotation), LVGL zoom: %u (scale: %.3f)", 
-             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH, USEABLE_HEIGHT,
+             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH, useable_height,
              PPA_OUTPUT_WIDTH, PPA_OUTPUT_HEIGHT, lvgl_zoom, scale);
     ESP_LOGI(TAG, "Final display size: %dx%d at (%d,%d)", 
              display_width_final, display_height_final, img_x, img_y);
@@ -760,13 +533,10 @@ static void preview_task(void *pvParameters)
             // ASYNC PATH: Use AXI GDMA for fast PSRAM-to-PSRAM memcpy (non-blocking)
             if (scaled_buffer && dma_handle) {
                 // Start DMA transfer (non-blocking, returns immediately ~1-2us)
-                // Callback will signal frame_ready_sem when DMA completes
-                esp_err_t dma_ret = esp_async_memcpy(dma_handle, 
-                                                     scaled_buffer, 
-                                                     frame_trans.buffer, 
-                                                     CAMERA_HRES * CAMERA_VRES * sizeof(uint16_t),
-                                                     dma_done_callback, 
-                                                     frame_ready_sem);  // CRITICAL: Pass semaphore to callback!
+                // Callback will signal frame_ready_for_display when DMA completes
+                esp_err_t dma_ret = camera_dma_transfer(scaled_buffer, 
+                                                        frame_trans.buffer, 
+                                                        CAMERA_HRES * CAMERA_VRES * sizeof(uint16_t));
                 
                 int64_t ppa_end = esp_timer_get_time();
                 
@@ -1015,32 +785,14 @@ esp_err_t camera_start(void)
         esp_cache_msync(scaled_buffer, scaled_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
     }
     
-    // Initialize PPA if not done
+    // Initialize PPA if not done (using camera_ppa module)
     if (!ppa_client) {
-        ESP_RETURN_ON_ERROR(init_ppa(), TAG, "PPA initialization failed");
+        ESP_RETURN_ON_ERROR(camera_ppa_init(), TAG, "PPA initialization failed");
     }
     
-    // Initialize DMA for fast PSRAM memcpy (truly async - no blocking)
+    // Initialize DMA for fast PSRAM memcpy (using camera_dma module)
     if (!dma_handle) {
-        ESP_LOGI(TAG, "Initializing AXI GDMA for async PSRAM memcpy...");
-        
-        async_memcpy_config_t dma_config = {
-            .backlog = 4,  // Queue up to 4 pending transfers
-            .sram_trans_align = 4,  // 4-byte alignment for SRAM
-            .psram_trans_align = 64,  // 64-byte alignment for PSRAM (optimal for cache)
-            .dma_burst_size = 64,  // 64-byte bursts for PSRAM efficiency
-            .flags = 0
-        };
-        
-        // ESP32-P4 has AXI GDMA which can access PSRAM efficiently
-        // Note: Default install() uses AHB GDMA which doesn't support PSRAM!
-        ret = esp_async_memcpy_install_gdma_axi(&dma_config, &dma_handle);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to initialize AXI GDMA: %s", esp_err_to_name(ret));
-            return ret;
-        }
-        
-        ESP_LOGI(TAG, "AXI GDMA initialized (async, non-blocking, expected ~35ms per 4MB frame)");
+        ESP_RETURN_ON_ERROR(camera_dma_init(), TAG, "DMA initialization failed");
     }
     
     // Create semaphore for frame ready notifications
