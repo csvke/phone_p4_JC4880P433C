@@ -61,6 +61,7 @@
 #include "camera_isp.h"
 #include "camera_sensor.h"
 #include "camera_controller.h"
+#include "camera_display.h"
 
 static const char *TAG = "camera";
 
@@ -156,123 +157,7 @@ static esp_err_t init_isp_processor(void)
 /**
  * Initialize LVGL canvas for camera preview
  */
-static esp_err_t init_preview_display(void)
-{
-    ESP_LOGI(TAG, "Initializing LVGL canvas preview...");
-    
-    if (!preview_parent) {
-        ESP_LOGE(TAG, "No preview parent set");
-        return ESP_FAIL;
-    }
-    
-    display = lv_display_get_default();
-    if (!display) {
-        ESP_LOGE(TAG, "No LVGL display found");
-        return ESP_FAIL;
-    }
-    
-    // Get display size (Brookesia may return useable area, not full display)
-    // Use display constants from camera_internal.h
-    // DISPLAY_WIDTH = 480, DISPLAY_HEIGHT = 800 (full display including status bar)
-    // STATUS_BAR_HEIGHT = 40 (defined in camera_internal.h)
-    const int useable_height = DISPLAY_HEIGHT - STATUS_BAR_HEIGHT; // 800 - 40 = 760
-    
-    // Camera outputs CAMERA_HRES×CAMERA_VRES (no rotation, landscape)
-    // We need to scale this to fit within 480x760 useable area
-    // Calculate zoom factor (LVGL uses 256 = 100%)
-    const int PPA_OUTPUT_WIDTH = CAMERA_HRES;   // No rotation (testing bandwidth)
-    const int PPA_OUTPUT_HEIGHT = CAMERA_VRES;
-    
-    float scale_x = (float)DISPLAY_WIDTH / PPA_OUTPUT_WIDTH;
-    float scale_y = (float)useable_height / PPA_OUTPUT_HEIGHT;
-    float scale = (scale_x < scale_y) ? scale_x : scale_y;  // Use smaller to fit both
-    
-    // Convert to LVGL zoom (256 = 100%)
-    uint16_t lvgl_zoom = (uint16_t)(scale * 256);
-    
-    // Calculate final displayed size
-    int display_width_final = (int)(PPA_OUTPUT_WIDTH * scale);
-    int display_height_final = (int)(PPA_OUTPUT_HEIGHT * scale);
-    
-    // Center horizontally and vertically
-    int img_x = (DISPLAY_WIDTH - display_width_final) / 2;
-    int img_y = STATUS_BAR_HEIGHT + (useable_height - display_height_final) / 2;
-    
-    ESP_LOGI(TAG, "Display: %dx%d (useable: %dx%d), PPA output: %dx%d (no rotation), LVGL zoom: %u (scale: %.3f)", 
-             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH, useable_height,
-             PPA_OUTPUT_WIDTH, PPA_OUTPUT_HEIGHT, lvgl_zoom, scale);
-    ESP_LOGI(TAG, "Final display size: %dx%d at (%d,%d)", 
-             display_width_final, display_height_final, img_x, img_y);
-    
-    // Create LVGL image widget for camera preview (hardware-accelerated scaling)
-    // Using lv_img instead of lv_canvas allows LVGL to use hardware 2D-DMA for scaling
-    preview_canvas = lv_img_create(preview_parent);
-    if (!preview_canvas) {
-        ESP_LOGE(TAG, "Failed to create LVGL image widget");
-        return ESP_FAIL;
-    }
-    
-    // Set image position and pivot point (for zoom)
-    lv_obj_set_pos(preview_canvas, img_x, img_y);
-    lv_img_set_pivot(preview_canvas, 0, 0);  // Zoom from top-left corner
-    lv_img_set_zoom(preview_canvas, lvgl_zoom);  // Apply zoom factor
-    lv_obj_clear_flag(preview_canvas, LV_OBJ_FLAG_SCROLLABLE);
-    
-    ESP_LOGI(TAG, "LVGL image widget created with zoom=%u (%.1f%%), will scale PPA output to fit display", 
-             lvgl_zoom, (float)lvgl_zoom / 256 * 100);
-    ESP_LOGI(TAG, "Image widget positioned at (%d,%d), final size: %dx%d", 
-             img_x, img_y, display_width_final, display_height_final);
-    
-    return ESP_OK;
-}
 
-/**
- * LVGL timer callback: Updates display framebuffer from LVGL thread
- * 
- * This runs in the LVGL thread context (safe to access LVGL objects)
- * The camera task signals when a new frame is ready via frame_ready_for_display flag
- * 
- * Uses lv_img widget with direct buffer source for hardware-accelerated scaling
- */
-static void display_update_timer_cb(lv_timer_t *timer)
-{
-    // Check if camera is still running
-    if (!preview_running) {
-        return;
-    }
-    
-    // Check if new frame is available
-    if (!frame_ready_for_display || !scaled_buffer || !display) {
-        return;
-    }
-    
-    // Clear flag immediately to avoid re-processing same frame
-    frame_ready_for_display = false;
-    
-    static uint32_t update_count = 0;
-    update_count++;
-    
-    // NO cache sync needed here! DMA writes directly to PSRAM, LVGL reads from PSRAM
-    // Cache sync is only needed when CPU writes to PSRAM (not for DMA writes)
-    
-    // Create image descriptor for direct buffer access
-    // Camera outputs CAMERA_HRES×CAMERA_VRES (no rotation - testing bandwidth)
-    static lv_image_dsc_t img_dsc;
-    img_dsc.header.w = CAMERA_HRES;
-    img_dsc.header.h = CAMERA_VRES;
-    img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-    img_dsc.header.stride = CAMERA_HRES * 2;  // Bytes per row
-    img_dsc.data_size = CAMERA_HRES * CAMERA_VRES * 2;
-    img_dsc.data = (const uint8_t *)scaled_buffer;
-    
-    // Update image source - LVGL will handle scaling via zoom property
-    lv_img_set_src(preview_canvas, &img_dsc);
-    
-    if (update_count <= 10) {
-        ESP_LOGI(TAG, "Display update #%lu - Image source updated (%dx%d passthrough, LVGL zoom active)", 
-                 update_count, CAMERA_HRES, CAMERA_VRES);
-    }
-}
 
 /**
  * Preview task that receives frames and updates display
@@ -676,7 +561,7 @@ esp_err_t camera_start(void)
     ESP_RETURN_ON_ERROR(init_isp_processor(), TAG, "ISP processor init failed");
     
     // Initialize LVGL display
-    ESP_RETURN_ON_ERROR(init_preview_display(), TAG, "Preview display init failed");
+    ESP_RETURN_ON_ERROR(camera_display_init(), TAG, "Preview display init failed");
     
     ESP_LOGI(TAG, "Camera controller started, creating preview task");
     
@@ -698,22 +583,15 @@ esp_err_t camera_start(void)
         return ESP_FAIL;
     }
     
-    // Create LVGL timer to update display (runs in LVGL thread context)
-    // This safely handles image source updates without cross-thread LVGL access
-    // Set to 30 FPS (33ms) - PPA rotation-only should easily handle this
-    bsp_display_lock(0);
-    update_timer = lv_timer_create(display_update_timer_cb, 33, NULL);  // 30 FPS target
-    if (!update_timer) {
-        ESP_LOGE(TAG, "Failed to create display update timer");
-        bsp_display_unlock();
+    // Start display update timer (runs in LVGL thread context)
+    esp_err_t timer_ret = camera_display_start_timer();
+    if (timer_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start display update timer");
         preview_running = false;
         camera_controller_stop();
         vTaskDelete(preview_task_handle);
-        return ESP_FAIL;
+        return timer_ret;
     }
-    bsp_display_unlock();
-    
-    ESP_LOGI(TAG, "Display update timer created (33ms interval, 30 FPS target)");
     
     // Note: Task will call esp_cam_ctlr_receive() in its loop (like the example)
     ESP_LOGI(TAG, "Camera started successfully");
@@ -741,14 +619,8 @@ esp_err_t camera_stop(void)
         camera_controller_stop();
     }
     
-    // Delete LVGL update timer
-    if (update_timer) {
-        bsp_display_lock(0);
-        lv_timer_delete(update_timer);
-        update_timer = NULL;
-        bsp_display_unlock();
-        ESP_LOGI(TAG, "Display update timer deleted");
-    }
+    // Stop display update timer
+    camera_display_stop_timer();
     
     // Signal task to stop
     preview_running = false;
@@ -785,6 +657,7 @@ bool camera_is_running(void)
 void camera_set_parent(lv_obj_t *parent)
 {
     preview_parent = parent;
+    camera_display_set_parent(parent);
     ESP_LOGI(TAG, "Preview parent set to %p", parent);
 }
 
@@ -833,9 +706,8 @@ void camera_deinit(void)
         ppa_done_sem = NULL;
     }
     
-    // Clean up display reference
-    display = NULL;
-    preview_canvas = NULL;
+    // Clean up display resources
+    camera_display_deinit();
     
     // Free frame buffers
     if (frame_buffer) {
