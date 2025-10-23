@@ -62,6 +62,7 @@
 #include "camera_sensor.h"
 #include "camera_controller.h"
 #include "camera_display.h"
+#include "camera_task.h"
 
 static const char *TAG = "camera";
 
@@ -131,9 +132,6 @@ volatile bool frame_ready_for_display = false;
 // Camera transaction descriptor
 esp_cam_ctlr_trans_t frame_trans = {0};
 
-// Task handle for frame reception
-TaskHandle_t preview_task_handle = NULL;
-
 // Timing measurement variables (use TickType_t for ISR-safe timing)
 TickType_t last_callback_time = 0;
 int64_t last_frame_time_us = 0;
@@ -143,312 +141,9 @@ uint32_t ppa_callback_count = 0;
 uint32_t semaphore_overflow_count = 0;
 uint32_t lvgl_lock_timeout_count = 0;
 
-
-
 /**
- * Initialize ISP processor - NOW IMPLEMENTED IN camera_isp.c
- * This wrapper kept for legacy compatibility during refactoring
+ * Start camera preview
  */
-static esp_err_t init_isp_processor(void)
-{
-    return camera_isp_init();
-}
-
-/**
- * Initialize LVGL canvas for camera preview
- */
-
-
-/**
- * Preview task that receives frames and updates display
- * 
- * This follows the esp-idf example pattern: continuously call esp_cam_ctlr_receive()
- * in a blocking loop. The receive() call blocks until a frame is ready, then returns.
- */
-static void preview_task(void *pvParameters)
-{
-    ESP_LOGI(TAG, "Preview task started");
-    
-    // Subscribe to watchdog to prevent triggering (camera task keeps CPU1 busy)
-    esp_task_wdt_add(NULL);  // Add current task to watchdog
-    
-    uint32_t frame_count = 0;
-    TickType_t last_log_time = xTaskGetTickCount();
-    
-    // Use global frame_trans which is set up by callbacks (ISP requires this!)
-    
-    while (preview_running) {
-        // *** ISP-INTEGRATED PATTERN: Pure callback-driven (no manual receive() needed) ***
-        // The ISP callbacks handle buffer management automatically
-        // We just wait for frame_ready notification from callback
-        
-        // Wait for callback notification that frame is ready
-        if (xSemaphoreTake(frame_ready_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
-            // Get semaphore count to diagnose the issue
-            UBaseType_t sem_count = uxSemaphoreGetCount(frame_ready_sem);
-            ESP_LOGE(TAG, "⚠️  FRAME TIMEOUT after frame #%lu - no callback received in 1 second!", frame_count);
-            ESP_LOGE(TAG, "    Semaphore count: %u, Dropped frames: %lu", sem_count, semaphore_overflow_count);
-            ESP_LOGE(TAG, "    Camera callbacks should be firing - check if they stopped!");
-            continue;
-        }
-        
-        // Check semaphore backlog (how many pending frames)
-        UBaseType_t sem_count = uxSemaphoreGetCount(frame_ready_sem);
-        if (sem_count > 5) {
-            ESP_LOGW(TAG, "⚠️ Semaphore backlog: %u pending frames queued", sem_count);
-        }
-        
-        // Frame is ready in frame_trans.buffer (set by callbacks)
-        esp_err_t ret = ESP_OK;
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to receive frame: %s", esp_err_to_name(ret));
-            continue;
-        }
-        
-        // Measure frame timing (NOW safe to use esp_timer_get_time in task context)
-        int64_t frame_time_us = esp_timer_get_time();
-        int64_t processing_start = frame_time_us;
-        
-        // Frame received successfully!
-        frame_count++;
-            
-            // Calculate frame interval (time between consecutive frames)
-            int64_t frame_interval_us = 0;
-            if (last_frame_time_us != 0) {
-                frame_interval_us = frame_time_us - last_frame_time_us;
-            }
-            last_frame_time_us = frame_time_us;
-            
-            // Log detailed timing analysis for first 10 frames
-            // OPTIMIZATION: Disable verbose logging during frame processing
-            // Logging takes ~200ms per frame and blocks the preview task!
-            // Only log basic info for first 3 frames, then every 30th frame
-            if (frame_count <= 3 || frame_count % 30 == 0) {
-                if (frame_interval_us > 0) {
-                    float fps = 1000000.0f / frame_interval_us;
-                    ESP_LOGI(TAG, "Frame #%lu: interval %lld μs (%.1f FPS)", 
-                             frame_count, frame_interval_us, fps);
-                }
-            }
-            
-            // Sync cache before accessing the frame buffer
-            int64_t cache_sync_start = esp_timer_get_time();
-            esp_cache_msync(frame_trans.buffer, frame_trans.buflen, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-            int64_t cache_sync_end = esp_timer_get_time();
-            
-            // Sample pixels from different parts of the frame (first 10 frames only for debugging)
-            if (frame_count <= 10) {
-                uint16_t *pixels = (uint16_t *)frame_trans.buffer;
-                int mid_idx = (CAMERA_VRES / 2) * CAMERA_HRES + (CAMERA_HRES / 2);
-                int corner_idx = (CAMERA_VRES - 1) * CAMERA_HRES + (CAMERA_HRES - 1);
-                ESP_LOGI(TAG, "Frame #%lu - Start: 0x%04x Mid: 0x%04x End: 0x%04x", 
-                        frame_count, pixels[0], pixels[mid_idx], pixels[corner_idx]);
-            }
-            
-            // TESTING: NO ROTATION - Camera physically mounted for portrait
-            // Camera buffer is 1288×728 in memory, but if mounted rotated, 
-            // the visual scene is portrait. Keep buffer dimensions as-is.
-            // PPA: Just pass through (no rotation, no scaling)
-            
-            int64_t ppa_start = esp_timer_get_time();
-            
-            // ⚠️ TESTING: Skip memcpy to measure ISP timing only ⚠️
-            #define SKIP_MEMCPY_TEST 0
-            
-            #if SKIP_MEMCPY_TEST
-            // Skip memcpy completely - just measure ISP output timing
-            int64_t ppa_end = esp_timer_get_time();
-            
-            // Signal frame ready WITHOUT copying
-            frame_ready_for_display = false;  // Don't display (buffer not copied)
-            
-            if (frame_count <= 10) {
-                ESP_LOGI(TAG, "Frame #%lu - ISP output ready (SKIPPED memcpy test)", 
-                        frame_count);
-                ESP_LOGI(TAG, "                ISP-only time: %lld us", 
-                        ppa_end - ppa_start);
-            }
-            #else
-            // ASYNC PATH: Use AXI GDMA for fast PSRAM-to-PSRAM memcpy (non-blocking)
-            if (scaled_buffer && dma_handle) {
-                // Start DMA transfer (non-blocking, returns immediately ~1-2us)
-                // Callback will signal frame_ready_for_display when DMA completes
-                esp_err_t dma_ret = camera_dma_transfer(scaled_buffer, 
-                                                        frame_trans.buffer, 
-                                                        CAMERA_HRES * CAMERA_VRES * sizeof(uint16_t));
-                
-                int64_t ppa_end = esp_timer_get_time();
-                
-                if (dma_ret == ESP_OK) {
-                    // DMA started successfully - it will complete in background
-                    // Callback will set frame_ready_for_display and signal semaphore
-                    
-                    if (frame_count <= 10) {
-                        ESP_LOGI(TAG, "Frame #%lu - DMA started (async, %dx%d)", 
-                                frame_count, CAMERA_HRES, CAMERA_VRES);
-                        ESP_LOGI(TAG, "                DMA start time: %lld us (non-blocking)", 
-                                ppa_end - ppa_start);
-                    }
-                } else {
-                    // Fallback to CPU memcpy if DMA fails to start
-                    ESP_LOGW(TAG, "DMA start failed (%s), falling back to CPU memcpy", esp_err_to_name(dma_ret));
-                    memcpy(scaled_buffer, frame_trans.buffer, 
-                           CAMERA_HRES * CAMERA_VRES * sizeof(uint16_t));
-                    
-                    ppa_end = esp_timer_get_time();
-                    frame_ready_for_display = true;
-                    
-                    // Signal semaphore for CPU fallback path
-                    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-                    xSemaphoreGiveFromISR(frame_ready_sem, &xHigherPriorityTaskWoken);
-                    
-                    if (frame_count <= 10) {
-                        ESP_LOGW(TAG, "Frame #%lu - CPU fallback copy (DMA failed)", frame_count);
-                        ESP_LOGI(TAG, "                CPU time: %lld us", ppa_end - ppa_start);
-                    }
-                }
-            }
-            #endif // SKIP_MEMCPY_TEST
-            
-            #if 0  // DISABLED: ORIGINAL PPA PATH (not used for testing)
-            if (ppa_client && scaled_buffer) {
-                // Keep actual buffer dimensions (1288×728 as sensor outputs)
-                const int output_width = CAMERA_HRES;   // 1288 (actual buffer width)
-                const int output_height = CAMERA_VRES;  // 728 (actual buffer height)
-
-                // PPA configuration: PASSTHROUGH - No rotation, no scaling
-                ppa_srm_oper_config_t srm_config = {
-                    .in = {
-                        .buffer = frame_trans.buffer,
-                        .pic_w = CAMERA_HRES,  // 1288 (actual sensor width)
-                        .pic_h = CAMERA_VRES,  // 728 (actual sensor height)
-                        .block_w = CAMERA_HRES,
-                        .block_h = CAMERA_VRES,
-                        .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                    },
-                    .out = {
-                        .buffer = scaled_buffer,
-                        .buffer_size = scaled_buffer_size,
-                        .pic_w = output_width,      // 1288 (no change)
-                        .pic_h = output_height,     // 728 (no change)
-                        .block_offset_x = 0,
-                        .block_offset_y = 0,
-                        .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                    },
-                    .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,  // NO rotation
-                    .scale_x = 1.0f,  // No scaling (passthrough)
-                    .scale_y = 1.0f,  // No scaling (passthrough)
-                    .mirror_x = false,
-                    .mirror_y = false,
-                    .rgb_swap = false,
-                    .byte_swap = false,
-                    .alpha_update_mode = PPA_ALPHA_NO_CHANGE,
-                    .mode = PPA_TRANS_MODE_NON_BLOCKING,  // Non-blocking to avoid deadlock
-                    .user_data = NULL,
-                };
-                
-                // DEBUG: Log before PPA call
-                if (frame_count <= 10) {
-                    ESP_LOGI(TAG, "Frame #%lu - Starting PPA operation (non-blocking)...", frame_count);
-                }
-                
-                // Start PPA scaling operation (non-blocking - returns immediately)
-                esp_err_t ppa_ret = ppa_do_scale_rotate_mirror(ppa_client, &srm_config);
-                
-                // DEBUG: Log PPA return
-                if (frame_count <= 10) {
-                    ESP_LOGI(TAG, "Frame #%lu - PPA call returned: %s", 
-                            frame_count, esp_err_to_name(ppa_ret));
-                }
-                
-                if (ppa_ret == ESP_OK) {
-                    // DEBUG: Log before semaphore wait
-                    if (frame_count <= 10) {
-                        ESP_LOGI(TAG, "Frame #%lu - Waiting for PPA semaphore (100ms timeout)...", frame_count);
-                    }
-                    
-                    // Wait for PPA callback to signal completion
-                    BaseType_t sem_result = xSemaphoreTake(ppa_done_sem, pdMS_TO_TICKS(100));
-                    
-                    // DEBUG: Log semaphore result
-                    if (frame_count <= 10) {
-                        ESP_LOGI(TAG, "Frame #%lu - Semaphore result: %s", 
-                                frame_count, sem_result == pdTRUE ? "SUCCESS" : "TIMEOUT");
-                    }
-                    
-                    if (sem_result == pdTRUE) {
-                        // PPA operation complete, sync cache
-                        int64_t cache_start = esp_timer_get_time();
-                        esp_cache_msync(scaled_buffer, scaled_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-                        int64_t cache_end = esp_timer_get_time();
-                        
-                        int64_t ppa_end = esp_timer_get_time();
-                        
-                        // Signal that a new frame is ready for display
-                        // The LVGL timer callback will handle the actual framebuffer update
-                        // This avoids accessing LVGL objects from the camera task
-                        frame_ready_for_display = true;
-                        
-                        if (frame_count <= 10) {
-                            ESP_LOGI(TAG, "Frame #%lu - Passthrough complete (%dx%d, no rotation)", 
-                                    frame_count, CAMERA_HRES, CAMERA_VRES);
-                            ESP_LOGI(TAG, "                PPA time: %lld us (passthrough), Cache: %lld us", 
-                                    ppa_end - ppa_start, cache_end - cache_start);
-                        }
-                        
-                        // Log PPA timing for first 10 frames
-                        if (frame_count <= 10) {
-                            int64_t ppa_time_us = ppa_end - ppa_start;
-                            ESP_LOGI(TAG, "Frame #%lu - PPA passthrough: %lld us (no rotation), output: %dx%d", 
-                                    frame_count, ppa_time_us, output_width, output_height);
-                        }
-                    } else {
-                        ESP_LOGW(TAG, "PPA timeout waiting for completion");
-                    }
-                } else {
-                    ESP_LOGW(TAG, "PPA operation failed: %s", esp_err_to_name(ppa_ret));
-                }
-            }
-            #endif  // Disabled PPA path
-            
-            int64_t processing_end = esp_timer_get_time();
-            
-            // Log detailed timing for first 10 frames
-            if (frame_count <= 10) {
-                int64_t cache_sync_time_us = cache_sync_end - cache_sync_start;
-                int64_t total_processing_us = processing_end - processing_start;
-                
-                ESP_LOGI(TAG, "Frame #%lu timing - Cache sync: %lld us, Total: %lld us", 
-                        frame_count, cache_sync_time_us, total_processing_us);
-            }
-            
-            // Yield to prevent watchdog timeout (allows idle task to run)
-            vTaskDelay(pdMS_TO_TICKS(1));
-            
-            // Reset watchdog for this task
-            esp_task_wdt_reset();
-            
-            // Log comprehensive frame rate info every second
-            TickType_t now = xTaskGetTickCount();
-            if ((now - last_log_time) >= pdMS_TO_TICKS(1000)) {
-                UBaseType_t sem_count = uxSemaphoreGetCount(frame_ready_sem);
-                ESP_LOGI(TAG, "📊 Status: %lu fps | Callbacks: cam=%lu ppa=%lu | Dropped: %lu | LVGL fails: %lu | Queue: %u", 
-                        frame_count, frame_count, ppa_callback_count, 
-                        semaphore_overflow_count, lvgl_lock_timeout_count, sem_count);
-                frame_count = 0;
-                last_log_time = now;
-            }
-    }
-    
-    ESP_LOGI(TAG, "Preview task ended");
-    
-    // Unsubscribe from watchdog before exiting
-    esp_task_wdt_delete(NULL);
-    
-    preview_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-
 /**
  * Start camera preview
  */
@@ -558,40 +253,19 @@ esp_err_t camera_start(void)
     ESP_RETURN_ON_ERROR(camera_controller_start(), TAG, "Camera controller start failed");
     
     // Initialize ISP processor (MANDATORY - ESP32-P4 requires ISP in pipeline)
-    ESP_RETURN_ON_ERROR(init_isp_processor(), TAG, "ISP processor init failed");
+    ESP_RETURN_ON_ERROR(camera_isp_init(), TAG, "ISP processor init failed");
     
     // Initialize LVGL display
     ESP_RETURN_ON_ERROR(camera_display_init(), TAG, "Preview display init failed");
     
-    ESP_LOGI(TAG, "Camera controller started, creating preview task");
+    ESP_LOGI(TAG, "Camera controller started, starting preview task and display timer");
     
-    // Start preview task - it will handle receive() in blocking loop (ESP-IDF example pattern)
+    // Start preview task (handles frame reception and DMA transfer)
     preview_running = true;
-    BaseType_t task_ret = xTaskCreate(
-        preview_task,
-        "camera_preview",
-        8192,
-        NULL,
-        tskIDLE_PRIORITY + 3,
-        &preview_task_handle
-    );
-    
-    if (task_ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create preview task");
-        preview_running = false;
-        camera_controller_stop();
-        return ESP_FAIL;
-    }
+    ESP_RETURN_ON_ERROR(camera_task_start(), TAG, "Failed to start preview task");
     
     // Start display update timer (runs in LVGL thread context)
-    esp_err_t timer_ret = camera_display_start_timer();
-    if (timer_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start display update timer");
-        preview_running = false;
-        camera_controller_stop();
-        vTaskDelete(preview_task_handle);
-        return timer_ret;
-    }
+    ESP_RETURN_ON_ERROR(camera_display_start_timer(), TAG, "Failed to start display timer");
     
     // Note: Task will call esp_cam_ctlr_receive() in its loop (like the example)
     ESP_LOGI(TAG, "Camera started successfully");
@@ -622,22 +296,9 @@ esp_err_t camera_stop(void)
     // Stop display update timer
     camera_display_stop_timer();
     
-    // Signal task to stop
+    // Signal and stop preview task
     preview_running = false;
-    
-    // Wake up task
-    if (frame_ready_sem) {
-        xSemaphoreGive(frame_ready_sem);
-    }
-    
-    // Wait for task to finish
-    if (preview_task_handle) {
-        int timeout_ms = 500;
-        while (preview_task_handle != NULL && timeout_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            timeout_ms -= 10;
-        }
-    }
+    camera_task_stop();
     
     ESP_LOGI(TAG, "Camera stopped");
     return ESP_OK;

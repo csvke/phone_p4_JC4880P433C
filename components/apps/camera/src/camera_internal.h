@@ -97,9 +97,6 @@ extern size_t scaled_buffer_size;
 // Frame transaction descriptor
 extern esp_cam_ctlr_trans_t frame_trans;
 
-// Task handle
-extern TaskHandle_t preview_task_handle;
-
 // Frame ready flag
 extern volatile bool frame_ready_for_display;
 
